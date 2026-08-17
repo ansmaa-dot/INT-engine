@@ -1,0 +1,24 @@
+{
+  "profiles": [
+    {
+      "id": "lis_api_key",
+      "type": "api_key",
+      "header_name": "X-API-Key",
+      "api_key": "REPLACE_ME"
+    },
+    {
+      "id": "his_basic",
+      "type": "basic",
+      "username": "REPLACE_ME",
+      "password": "REPLACE_ME"
+    },
+    {
+      "id": "ris_oauth",
+      "type": "oauth2_client_credentials",
+      "token_url": "https://example.com/oauth/token",
+      "client_id": "REPLACE_ME",
+      "client_secret": "REPLACE_ME",
+      "scope": "orders.read orders.write"
+    }
+  ]
+}

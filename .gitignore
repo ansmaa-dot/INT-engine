@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+queue.db
+queue.db-*
+config/auth_profiles.json
+.agent_audit.log
+__pycache__/
+*.pyc

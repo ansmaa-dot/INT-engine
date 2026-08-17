@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Channel Messages — {{ channel_name }} — Integration Engine</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        :root {
+            --bg-page: #e2e8f0;
+            --panel-bg: #f8fafc;
+            --panel-border: #94a3b8;
+            --accent-blue: #0284c7;
+            --accent-blue-hover: #0369a1;
+            --status-green: #16a34a;
+            --status-yellow: #ca8a04;
+            --status-red: #dc2626;
+            --text-main: #0f172a;
+            --text-muted: #475569;
+            --code-font: 'Courier New', Courier, monospace;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-page);
+            color: var(--text-main);
+            font-size: 14px;
+            padding: 20px;
+        }
+
+        .page-wrap { max-width: 1400px; margin: 0 auto; }
+
+        header {
+            background: linear-gradient(180deg, #334155 0%, #0f172a 100%);
+            color: #ffffff;
+            padding: 14px 22px;
+            border-radius: 5px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 18px;
+            border-bottom: 2px solid var(--accent-blue);
+        }
+
+        header h1 {
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 0.5px;
+            text-shadow: 1px 1px 2px #000;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .entry-link { color: var(--accent-blue); text-decoration: none; cursor: pointer; }
+
+        .section-box {
+            border: 1px solid #cbd5e1;
+            border-radius: 4px;
+            background: #f8fafc;
+            overflow: hidden;
+            margin-bottom: 18px;
+        }
+
+        .section-box h2 {
+            background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
+            border-bottom: 1px solid #cbd5e1;
+            padding: 9px 14px;
+            font-size: 13px;
+            font-weight: bold;
+            color: #334155;
+            text-shadow: 0 1px 0 #fff;
+        }
+
+        .section-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
+            border-bottom: 1px solid #cbd5e1;
+            padding-right: 14px;
+        }
+
+        .section-body { padding: 16px; }
+
+        table.data-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            background: #fff;
+        }
+
+        table.data-table th {
+            background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+            color: #334155;
+            text-align: left;
+            padding: 9px 12px;
+            border: 1px solid #cbd5e1;
+            font-weight: bold;
+            text-shadow: 0 1px 0 #fff;
+        }
+
+        table.data-table td {
+            padding: 9px 12px;
+            border: 1px solid #e2e8f0;
+            vertical-align: middle;
+        }
+
+        table.data-table tr:nth-child(even) { background-color: #f8fafc; }
+
+        #messages-table-body tr { cursor: pointer; }
+        #messages-table-body tr:hover { background-color: #f1f5f9; }
+        #messages-table-body tr.row-selected,
+        #messages-table-body tr.row-selected:nth-child(even) { background-color: #dbeafe; }
+
+        .pill {
+            display: inline-block;
+            padding: 2px 7px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: bold;
+            color: #fff;
+            text-transform: uppercase;
+        }
+        .pill-running { background-color: var(--status-green); }
+        .pill-paused { background-color: var(--status-yellow); }
+        .pill-error { background-color: var(--status-red); }
+
+        .btn {
+            background: linear-gradient(180deg, #ffffff 0%, #e2e8f0 100%);
+            border: 1px solid #94a3b8;
+            border-radius: 4px;
+            padding: 5px 12px;
+            font-size: 11px;
+            font-weight: bold;
+            color: #334155;
+            cursor: pointer;
+            box-shadow: inset 0 1px 0 #fff;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .btn:hover { background: linear-gradient(180deg, #f1f5f9 0%, #cbd5e1 100%); }
+
+        .btn-primary {
+            background: linear-gradient(180deg, #38bdf8 0%, var(--accent-blue) 100%);
+            border-color: #0369a1;
+            color: #ffffff;
+            text-shadow: 0 -1px 0 rgba(0,0,0,0.3);
+        }
+    .code-block {
+            font-family: var(--code-font);
+            background: #0f172a;
+            color: #38bdf8;
+            padding: 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            line-height: 1.5;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            border: 1px solid #334155;
+            min-height: 140px;
+            word-break: break-word;
+        }
+
+        .dim-block { color: #94a3b8; }
+
+        .grid-2col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            align-items: start;
+        }
+
+        .msg-meta {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 14px;
+            font-size: 12px;
+            color: var(--text-muted);
+            padding: 4px 0 14px;
+        }
+
+        .pane-title {
+            font-weight: bold;
+            font-size: 13px;
+            color: #334155;
+            padding: 9px 14px;
+            text-shadow: 0 1px 0 #fff;
+        }
+
+        .pane-sub { font-size: 10px; color: var(--text-muted); padding: 9px 0; }
+
+        .error-banner {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: var(--status-red);
+            padding: 10px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: var(--code-font);
+            white-space: pre-wrap;
+            word-break: break-word;
+            margin-bottom: 12px;
+        }
+
+        .error-banner.banner-ok {
+            background: #f0fdf4;
+            border-color: #bbf7d0;
+            color: #15803d;
+        }
+
+        .trace-details {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-radius: 4px;
+            padding: 8px 12px;
+            margin: 0 0 12px;
+            font-size: 12px;
+        }
+        .trace-details summary { cursor: pointer; font-weight: bold; color: var(--status-red); }
+
+        .trace-block {
+            font-family: var(--code-font);
+            background: #0f172a;
+            color: #f87171;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 10px;
+            line-height: 1.4;
+            margin-top: 8px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        @media (max-width: 900px) {
+            .grid-2col { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+  <div class="page-wrap">
+
+    <header>
+        <h1><span>&#9881;</span> {{ channel_name }}
+            <span class="pill {{ 'pill-running' if channel_status == 'running' else 'pill-paused' }}">{{ channel_status }}</span>
+        </h1>
+        <div style="display:flex; align-items:center; gap:12px;">
+            <code style="font-size:11px; color:#38bdf8;">{{ channel_id }}</code>
+            <a class="btn btn-primary" href="/">&#8592; Dashboard</a>
+        </div>
+    </header>
+
+    <div class="section-box">
+        <div class="section-header-row">
+            <h2 style="border-bottom:none;">Recent Messages</h2>
+            <span style="font-size:11px; color:var(--text-muted); padding:9px 0;">click a row to inspect its Source / Destination payloads</span>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>State</th>
+                    <th>Trace ID</th>
+                    <th>Attempts</th>
+                    <th>Received</th>
+                    <th>Payload Preview</th>
+                    <th>Error</th>
+                </tr>
+            </thead>
+            <tbody id="messages-table-body"
+                   hx-get="/channels/{{ channel_id }}/messages/body"
+                   hx-trigger="load, every 5s"></tbody>
+        </table>
+    </div>
+
+    <div class="section-box">
+        <h2>Message Inspector</h2>
+        <div class="section-body" id="split-inspector">
+            <div id="split-inspector-placeholder" class="code-block dim-block">Select a message from the list above to inspect its raw inbound (Source) and transformed outbound (Destination) payloads.</div>
+        </div>
+    </div>
+
+  </div>
+
+  <script>
+    let _selectedTrace = null;
+
+    function selectMessageRow(row) {
+        _selectedTrace = row.getAttribute('data-trace-id');
+        const rows = document.querySelectorAll('#messages-table-body tr');
+        rows.forEach((r) => r.classList.toggle('row-selected', r === row));
+    }
+
+    document.body.addEventListener('htmx:afterSwap', function (evt) {
+        if (evt.detail.target && evt.detail.target.id === 'messages-table-body') {
+            evt.detail.target.querySelectorAll('tr').forEach((tr) => {
+                tr.classList.toggle('row-selected', tr.getAttribute('data-trace-id') === _selectedTrace);
+            });
+            // Auto-open the newest message the first time the list loads.
+            if (!_selectedTrace && document.getElementById('split-inspector-placeholder')) {
+                const first = evt.detail.target.querySelector('tr');
+                if (first) first.click();
+            }
+        }
+    });
+  </script>
+</body>
+</html>
