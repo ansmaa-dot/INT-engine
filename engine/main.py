@@ -12,7 +12,7 @@ from engine.config_loader import ChannelConfigRegistry
 ACTIVE_WORKER_COUNTS = {}   # channel_id -> number of worker threads currently running for it
 ACTIVE_THREADS = {}         # channel_id -> list of worker threads
 ACTIVE_INGESTION = {}       # channel_id -> ingestion node instance (http_poller/mllp_server/file_watcher)
-BACKGROUND_INGESTION_TYPES = {"http_poller", "mllp_server", "file_watcher", "db_poller"}
+BACKGROUND_INGESTION_TYPES = {"http_poller", "mllp", "file_watcher", "db_poller"}
 RECLAIM_INTERVAL_S = 30
 STALE_PROCESSING_THRESHOLD_S = 120
 
@@ -21,11 +21,11 @@ registry = ChannelConfigRegistry("queue.db")
 
 def start_ingestion_node(channel_id, config, queue):
     """Starts a background ingestion source for channels configured with an
-    active ingestion_type that isn't 'http_webhook' (webhooks are handled by
+    active inbound transport that isn't 'http_webhook' (webhooks are handled by
     api/app.py since they need to live on the Flask process)."""
     if channel_id in ACTIVE_INGESTION:
         return
-    itype = config.get("ingestion_type")
+    itype = config.get("inbound_transport")
     if itype not in BACKGROUND_INGESTION_TYPES:
         return
     try:

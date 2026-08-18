@@ -292,6 +292,92 @@
             margin-top: 3px;
         }
 
+        /* --- Inspector panel fragments (from /ui/audit, /ui/dlq/<id>) --- */
+
+        .error-banner {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: var(--status-red);
+            padding: 10px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: var(--code-font);
+            white-space: pre-wrap;
+            word-break: break-word;
+            margin-bottom: 12px;
+        }
+
+        .error-banner.banner-ok {
+            background: #f0fdf4;
+            border-color: #bbf7d0;
+            color: #15803d;
+        }
+
+        .trace-details {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-radius: 4px;
+            padding: 8px 12px;
+            margin: 0 0 12px;
+            font-size: 12px;
+        }
+        .trace-details summary { cursor: pointer; font-weight: bold; color: var(--status-red); }
+
+        .trace-block {
+            font-family: var(--code-font);
+            background: #0f172a;
+            color: #f87171;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 10px;
+            line-height: 1.4;
+            margin-top: 8px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .msg-meta {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 14px;
+            font-size: 12px;
+            color: var(--text-muted);
+            padding: 4px 0 14px;
+        }
+
+        .pane-title {
+            font-weight: bold;
+            font-size: 13px;
+            color: #334155;
+            padding: 9px 14px;
+            text-shadow: 0 1px 0 #fff;
+        }
+
+        .pane-sub { font-size: 10px; color: var(--text-muted); padding: 9px 0; }
+
+        .pane-codec {
+            background: #0f172a;
+            color: #38bdf8;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            white-space: nowrap;
+        }
+
+        .dim-block { color: #94a3b8; }
+        .dest-sent { border-left: 3px solid var(--status-green); }
+
+        .pane { background: #fff; }
+        .pane-grid { align-items: stretch; }
+        .pane-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-right: 14px;
+        }
+
         @media (max-width: 900px) {
             .grid-2col { grid-template-columns: 1fr; }
             .metric-grid { grid-template-columns: repeat(2, 1fr); }
@@ -319,6 +405,7 @@
         <div class="tab active" id="tab-btn-dashboard" onclick="switchTab('dashboard')">Channel Control</div>
         <div class="tab" id="tab-btn-inspector" onclick="switchTab('inspector')">Engine Inspector</div>
         <div class="tab" id="tab-btn-editor" onclick="switchTab('editor')">Add / Edit Channel</div>
+        <div class="tab" id="tab-btn-defs" onclick="switchTab('defs')">Definitions</div>
     </div>
 
     <div class="main-window">
@@ -412,6 +499,20 @@
             </div>
         </div>
 
+        <!-- Definitions Panel -->
+        <div id="panel-defs" style="display: none;">
+            <div class="section-box" style="margin-bottom: 0;">
+                <div class="section-header-row">
+                    <h2 style="border-bottom: none;">Reusable Definitions</h2>
+                    <span style="font-size: 11px; color: var(--text-muted);">mappings · enrichments · retry policies</span>
+                </div>
+                <div class="section-body" id="defs-container"
+                     hx-get="/ui/defs" hx-trigger="revealed">
+                    <div class="code-block">Loading definitions...</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Editor Panel -->
         <div id="panel-editor" style="display: none;">
             <div class="section-box" style="margin-bottom: 0;">
@@ -426,7 +527,7 @@
   </div>
 
     <script>
-        const TAB_IDS = ['dashboard', 'inspector', 'editor'];
+        const TAB_IDS = ['dashboard', 'inspector', 'editor', 'defs'];
 
         function switchTab(tabId) {
             TAB_IDS.forEach(function(id) {
@@ -439,6 +540,13 @@
                 const container = document.getElementById('editor-container');
                 if (!container.innerHTML.trim()) {
                     htmx.ajax('GET', '/ui/channels/new', '#editor-container');
+                }
+            }
+            if (tabId === 'defs') {
+                // Trigger HTMX load if the container hasn't loaded yet
+                const container = document.getElementById('defs-container');
+                if (!container.innerHTML.trim() || container.querySelector('.code-block')) {
+                    htmx.ajax('GET', '/ui/defs', '#defs-container');
                 }
             }
         }

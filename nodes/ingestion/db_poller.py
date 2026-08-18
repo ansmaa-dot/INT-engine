@@ -1,7 +1,8 @@
+import json
 import threading
 import time
 
-from core.message import Envelope
+from core.transport import TransportMessage, to_envelope
 from nodes.base import IngestionNode
 
 
@@ -87,9 +88,17 @@ class DBPoller(IngestionNode):
             rows = [dict(zip(column_names, row)) for row in result.fetchall()]
 
         for row in rows:
-            env = Envelope(channel_id=self.channel_id, raw_payload=row)
+            # Each row is delivered as raw serialized content in the new
+            # input contract. The optional idempotency hint reads a column
+            # from the already-structured row — not a wire-format parser.
+            message_id = None
             if self.idempotency_key_field and isinstance(row, dict):
-                env.idempotency_key = str(row.get(self.idempotency_key_field, "")) or None
-            self.queue.enqueue(env)
+                message_id = str(row.get(self.idempotency_key_field, "")) or None
+            msg = TransportMessage(
+                raw=json.dumps(row) if isinstance(row, dict) else str(row),
+                source=self.channel_id,
+                message_id=message_id,
+            )
+            self.queue.enqueue(to_envelope(self.channel_id, msg))
             if self.cursor_field and isinstance(row, dict):
                 self._cursor = row.get(self.cursor_field, self._cursor)

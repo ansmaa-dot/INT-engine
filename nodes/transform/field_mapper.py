@@ -1,31 +1,56 @@
 # nodes/transform/field_mapper.py
+"""FieldMapper: transforms a CanonicalMessage (as its JSON form) using
+canonical paths as the normal contract.
+
+  * sources:  "patient.name", "order.accession.value", "observations.0.value",
+              "lookups.<lookup_name>.<field>" for enrichment reference data
+  * targets:  dotted canonical paths written back into the message
+
+The mapper starts from a copy of the canonical message and writes mapped
+values onto it, so untouched fields survive (the pipeline validates the full
+result back into a CanonicalMessage).
+
+There is intentionally NO "raw.*" business namespace: raw wire content stays
+available only for audit/replay/debugging, never as the transformation
+interface.
+"""
+import copy
+
+from core.canonical_paths import assign_path, resolve_path
 from core.message import Envelope
+from core.model import CanonicalMessage
 from nodes.base import TransformNode
 from nodes.transform.functions import REGISTRY
 
 
 class FieldMapper(TransformNode):
     def __init__(self, mappings: list[dict]):
-        # mapping format: [{"source": "order_id" | "lookups.patient.first_name",
-        #                    "target": "accession_number",
+        # mapping format: [{"source": "patient.name" | "lookups.ref.field",
+        #                    "target": "patient.name",
         #                    "required": True,
         #                    "fn": "Uppercase" | None,
         #                    "fn_args": {} }]
         self.mappings = mappings
 
-    def transform(self, raw_payload: dict, lookups: dict | None = None) -> dict:
-        """Transforms a raw payload dict (plus any enrichment lookups) into
-        mapped key-value pairs. Kept as a standalone method so it stays easy
-        to unit test without an Envelope."""
-        out = {}
+    def transform(self, canonical_dict: dict, lookups: dict | None = None) -> dict:
+        """Maps canonical paths onto a copy of the canonical message's JSON
+        form and returns the full updated dict."""
+        out = copy.deepcopy(canonical_dict) if isinstance(canonical_dict, dict) else {}
         for m in self.mappings:
-            src_key = m["source"]
-            target_key = m["target"]
-            is_required = m.get("required", False)
+            src_key = m.get("source")
+            target_key = m.get("target")
+            if not src_key or not target_key:
+                raise ValueError(f"mapping requires both source and target: {m!r}")
 
-            val = self._resolve(src_key, raw_payload, lookups or {})
-            if val is None and is_required:
-                raise ValueError(f"Required field missing from payload: '{src_key}'")
+            if src_key.startswith("lookups."):
+                val = resolve_path(lookups or {}, src_key[len("lookups."):])
+            else:
+                val = resolve_path(out, src_key)
+
+            if val is None and m.get("required", False):
+                raise ValueError(
+                    f"Required field missing from canonical message: '{src_key}'"
+                )
 
             fn_name = m.get("fn")
             if fn_name:
@@ -34,31 +59,13 @@ class FieldMapper(TransformNode):
                     raise ValueError(f"Unknown transform function: '{fn_name}'")
                 val = fn(val, **(m.get("fn_args") or {}))
 
-            out[target_key] = val
+            assign_path(out, target_key, val)
         return out
 
-    def _resolve(self, dotted_path: str, raw_payload: dict, lookups: dict):
-        """Supports plain keys ('order_id'), explicit 'raw.<field>', and
-        'lookups.<lookup_name>.<field>' for enrichment-attached data."""
-        parts = dotted_path.split(".")
-        if parts[0] == "lookups":
-            cur = lookups
-            parts = parts[1:]
-        elif parts[0] == "raw":
-            cur = raw_payload
-            parts = parts[1:]
-        else:
-            cur = raw_payload
-
-        for p in parts:
-            if cur is None:
-                return None
-            cur = cur.get(p) if isinstance(cur, dict) else getattr(cur, p, None)
-        return cur
-
     def apply(self, env: Envelope) -> Envelope:
-        """Envelope wrapper: pulls from raw_payload plus any enrichment
-        results already attached to env.lookups."""
-        out = self.transform(env.raw_payload, env.lookups)
-        env.transformed_payload = out
+        """Envelope wrapper: runs the mapping over the canonical message's
+        JSON form (plus any enrichment results on env.lookups) and stores the
+        validated result back as the envelope's canonical message."""
+        out = self.transform(env.canonical_dict, env.lookups)
+        env.canonical = CanonicalMessage.model_validate(out)
         return env

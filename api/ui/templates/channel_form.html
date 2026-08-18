@@ -1,0 +1,287 @@
+{% macro field_input(prefix, f) %}
+{%- set fid = prefix ~ '__' ~ f.name -%}
+{%- set val = f.value if f.value is not none else f.default -%}
+{%- if f.ftype == 'checkbox' -%}
+<label class="cf-checkbox">
+  <input type="checkbox" name="{{ fid }}"{% if val|string in ('True','true','1','on') %} checked{% endif %}{% if f.required %} required{% endif %}>
+  {{ f.label }}
+</label>
+{%- elif f.ftype.startswith('select:') -%}
+<label class="cf-label">{{ f.label }}
+  <select name="{{ fid }}" class="cf-input"{% if f.required %} required{% endif %}>
+    {%- for o in f.ftype[7:].split(',') -%}
+    <option value="{{ o }}"{% if o == val|string %} selected{% endif %}>{{ o }}</option>
+    {%- endfor -%}
+  </select>
+</label>
+{%- elif f.ftype == 'textarea' -%}
+<label class="cf-label">{{ f.label }}
+  <textarea name="{{ fid }}" class="cf-input cf-ta" rows="3" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>{{ val }}</textarea>
+</label>
+{%- elif f.ftype == 'password' -%}
+<label class="cf-label">{{ f.label }}
+  <input type="password" name="{{ fid }}" class="cf-input" value="{{ val }}" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>
+</label>
+{%- else -%}
+<label class="cf-label">{{ f.label }}
+  <input type="{{ f.ftype }}" name="{{ fid }}" class="cf-input" value="{{ val }}" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>
+</label>
+{%- endif -%}
+{% endmacro %}
+
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Channel Editor</title></head>
+<body style="margin:0;padding:0;background:transparent;">
+
+<form hx-post="/ui/channels/save" hx-target="#editor-container" hx-swap="innerHTML" class="channel-form" id="channel-form">
+
+  <div class="cf-header">
+    <span class="cf-header-icon">&#9881;</span>
+    <span>{{ 'Edit' if config.channel_id else 'New' }} Channel</span>
+    {% if config.channel_id %}<code class="cf-header-id">{{ config.channel_id }}</code>{% endif %}
+  </div>
+
+  <!-- Tab bar -->
+  <nav class="cf-tabs">
+    <button type="button" class="cf-tab active" data-step="0">1. Basic</button>
+    <button type="button" class="cf-tab" data-step="1">2. Source</button>
+    <button type="button" class="cf-tab" data-step="2">3. Pipeline</button>
+    <button type="button" class="cf-tab" data-step="3">4. Destination</button>
+  </nav>
+
+  <!-- STEP 0: Basic -->
+  <div class="cf-step active" data-step="0">
+    <fieldset class="cf-section">
+      <legend>Identity &amp; Runtime</legend>
+      <div class="cf-row cols-2">
+        <label class="cf-label">Channel ID <span class="cf-req">*</span>
+          <input name="channel_id" class="cf-input" value="{{ config.channel_id }}" required
+                 {% if config.channel_id %}readonly style="background:#f1f5f9;color:#64748b;"{% endif %}>
+        </label>
+        <label class="cf-label">Name <span class="cf-req">*</span>
+          <input name="name" class="cf-input" value="{{ config.name }}" required>
+        </label>
+      </div>
+      <div class="cf-row cols-3">
+        <label class="cf-label">Status
+          <select name="status" class="cf-input">
+            <option value="running"{% if config.status=='running' %} selected{% endif %}>Running</option>
+            <option value="paused"{% if config.status=='paused' %} selected{% endif %}>Paused</option>
+          </select>
+        </label>
+        <label class="cf-label">Concurrency
+          <input type="number" name="concurrency" class="cf-input" min="1" max="16" value="{{ config.concurrency }}">
+        </label>
+        <label class="cf-checkbox" style="margin-top:22px;">
+          <input type="checkbox" name="enabled"{% if config.enabled %} checked{% endif %}> Enabled
+        </label>
+      </div>
+    </fieldset>
+  </div>
+
+  <!-- STEP 1: Source -->
+  <div class="cf-step" data-step="1">
+    <fieldset class="cf-section">
+      <legend>Inbound Transport</legend>
+      <div class="cf-row cols-2">
+        <label class="cf-label">Transport <span class="cf-req">*</span>
+          <select name="inbound_transport" id="transport-select" class="cf-input">
+            {% for t in transports %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="cf-label">Codec <span class="cf-req">*</span>
+          <select name="inbound_codec" class="cf-input">
+            {% for c in codecs %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}
+          </select>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Connection</legend>
+      <p class="cf-hint">Fields shown depend on the transport selected above.</p>
+      <div id="transport-fields">
+        {% for tgroup in transport_groups %}
+        <div class="tc-group cf-card" data-transport="{{ tgroup.transport }}"
+             style="display:{{ 'block' if tgroup.visible else 'none' }};">
+          <div class="cf-card-title">{{ tgroup.transport_label }}</div>
+          <div class="cf-card-body cf-row cols-2">
+            {% for f in tgroup.fields %}{{ field_input('tc', f) }}{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </fieldset>
+  </div>
+
+  <!-- STEP 2: Pipeline -->
+  <div class="cf-step" data-step="2">
+    <fieldset class="cf-section">
+      <legend>Encoding &amp; Transformation</legend>
+      <label class="cf-label">Outbound Codec <span class="cf-req">*</span>
+        <select name="outbound_codec" class="cf-input">
+          {% for c in outbound_codecs %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>References</legend>
+      <div class="cf-row cols-2">
+        <div>
+          <label class="cf-label">Mapping
+            <select name="mapping_id" class="cf-input">
+              <option value="">None</option>
+              {% for m in mappings %}<option value="{{ m.value }}"{% if m.selected %} selected{% endif %}>{{ m.label }}</option>{% endfor %}
+            </select>
+          </label>
+          <label class="cf-label">Version
+            <input type="number" name="mapping_version" class="cf-input" min="1" value="{{ config.mapping_version or '' }}">
+          </label>
+        </div>
+        <div>
+          <label class="cf-label">Enrichment
+            <select name="enrichment_id" class="cf-input">
+              <option value="">None</option>
+              {% for e in enrichments %}<option value="{{ e.value }}"{% if e.selected %} selected{% endif %}>{{ e.label }}</option>{% endfor %}
+            </select>
+          </label>
+          <label class="cf-label">Version
+            <input type="number" name="enrichment_version" class="cf-input" min="1" value="{{ config.enrichment_version or '' }}">
+          </label>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Policies</legend>
+      <label class="cf-label">Retry Policy <span class="cf-req">*</span>
+        <select name="retry_policy_id" class="cf-input">
+          {% for r in retry_policies %}<option value="{{ r.value }}"{% if r.selected %} selected{% endif %}>{{ r.label }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="cf-label">Business Rules <small style="font-weight:400;">(JSON, optional)</small>
+        <textarea name="semantics" class="cf-input cf-ta" rows="4"
+                  placeholder='[{"field":"priority","rule":"required"}]'>{{ config.semantics or '' }}</textarea>
+      </label>
+    </fieldset>
+  </div>
+
+  <!-- STEP 3: Destination -->
+  <div class="cf-step" data-step="3">
+    <fieldset class="cf-section">
+      <legend>Outbound Destination</legend>
+      <label class="cf-label">Destination <span class="cf-req">*</span>
+        <select name="destination" id="destination-select" class="cf-input">
+          {% for d in destinations %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Connection</legend>
+      <p class="cf-hint">Fields shown depend on the destination selected above.</p>
+      <div id="destination-fields">
+        {% for dgroup in dest_groups %}
+        <div class="dc-group cf-card" data-destination="{{ dgroup.destination }}"
+             style="display:{{ 'block' if dgroup.visible else 'none' }};">
+          <div class="cf-card-title">{{ dgroup.dest_label }}</div>
+          <div class="cf-card-body cf-row cols-2">
+            {% for f in dgroup.fields %}{{ field_input('dc', f) }}{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </fieldset>
+  </div>
+
+  <input type="hidden" name="is_edit" value="true">
+  <input type="hidden" name="inbound_transport_config" id="inbound_transport_config" value="">
+  <input type="hidden" name="destination_config" id="destination_config" value="">
+
+  <div class="cf-actions">
+    <button type="button" class="btn" id="cf-prev" onclick="step(-1)" style="display:none;">&#8592; Back</button>
+    <div style="flex:1;"></div>
+    <button type="button" class="btn btn-primary" id="cf-next" onclick="step(1)">Next &#8594;</button>
+    <button type="submit" class="btn btn-primary" id="cf-save" style="display:none;">Save Channel</button>
+    <button type="button" class="btn" onclick="switchTab('dashboard')">Cancel</button>
+  </div>
+
+</form>
+
+<style>
+.channel-form{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px;color:#0f172a}
+.cf-header{display:flex;align-items:center;gap:8px;padding:0 0 14px;font-size:15px;font-weight:700;color:#1e293b}
+.cf-header-icon{font-size:18px}
+.cf-header-id{font-size:11px;color:#64748b;background:#f1f5f9;padding:2px 8px;border-radius:3px;font-weight:400}
+
+.cf-tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:2px solid #e2e8f0}
+.cf-tab{flex:1;padding:10px 12px;border:none;background:none;font-size:12px;font-weight:600;color:#94a3b8;cursor:pointer;text-align:center;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s;font-family:inherit}
+.cf-tab:hover{color:#64748b}
+.cf-tab.active{color:#0284c7;border-bottom-color:#0284c7}
+.cf-tab.done{color:#16a34a}
+
+.cf-step{display:none}
+.cf-step.active{display:block}
+
+.cf-section{border:1px solid #e2e8f0;border-radius:8px;padding:0;margin:0 0 14px;background:#fff}
+.cf-section legend{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#64748b;padding:0 8px;margin-left:8px}
+.cf-section>*:not(legend){padding:0 14px}
+.cf-section>*:last-child{padding-bottom:14px}
+.cf-hint{font-size:11px;color:#94a3b8;margin:-6px 0 10px;padding-top:0!important}
+
+.cf-row{display:grid;gap:10px;padding:10px 14px!important}
+.cf-row.cols-2{grid-template-columns:1fr 1fr}
+.cf-row.cols-3{grid-template-columns:1fr 1fr 1fr}
+
+.cf-label{display:block;margin-bottom:2px;font-size:11px;font-weight:600;color:#475569}
+.cf-req{color:#dc2626}
+.cf-input,.cf-ta{width:100%;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px;font-family:inherit;background:#fff;color:#0f172a;transition:border-color .15s;box-sizing:border-box;margin-top:3px}
+.cf-input:focus,.cf-ta:focus{outline:none;border-color:#0284c7;box-shadow:0 0 0 3px rgba(2,132,199,.12)}
+.cf-input[readonly]{background:#f8fafc;color:#94a3b8;cursor:default}
+.cf-ta{resize:vertical;font-family:"Courier New",monospace;font-size:11px;min-height:60px}
+.cf-input[type=checkbox]{width:auto;margin-right:6px;accent-color:#0284c7}
+.cf-checkbox{display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;cursor:pointer;padding:2px 0}
+
+.cf-card{border:1px solid #e2e8f0;border-radius:6px;overflow:hidden;background:#f8fafc;margin-bottom:8px}
+.cf-card-title{font-size:11px;font-weight:600;color:#0284c7;background:#f0f9ff;padding:7px 12px;border-bottom:1px solid #e0f2fe}
+.cf-card-body{padding:8px 12px!important}
+
+.cf-actions{display:flex;gap:8px;padding:4px 0 0;align-items:center}
+
+@media(max-width:640px){.cf-row.cols-2,.cf-row.cols-3{grid-template-columns:1fr}}
+</style>
+
+<script>
+(function(){
+var f=document.getElementById('channel-form'); if(!f)return;
+var steps=f.querySelectorAll('.cf-step'), tabs=f.querySelectorAll('.cf-tab');
+var prev=f.querySelector('#cf-prev'), next=f.querySelector('#cf-next'), save=f.querySelector('#cf-save');
+var total=steps.length, current=0;
+
+window.step=function(d){
+  var nextIdx=current+d;
+  if(nextIdx<0||nextIdx>=total)return;
+  steps[current].classList.remove('active');
+  tabs[current].classList.remove('active'); tabs[current].classList.add('done');
+  current=nextIdx;
+  steps[current].classList.add('active');
+  tabs[current].classList.add('active'); tabs[current].classList.remove('done');
+  prev.style.display=current===0?'none':'';
+  next.style.display=current===total-1?'none':'';
+  save.style.display=current===total-1?'':'none';
+};
+
+// --- Transport / destination toggle ---
+var ts=f.querySelector('#transport-select'), ds=f.querySelector('#destination-select');
+var htc=f.querySelector('#inbound_transport_config'), hdc=f.querySelector('#destination_config');
+function tg(s,g,a){g.forEach(function(x){x.style.display=x.getAttribute('data-'+a)===s.value?'block':'none'})}
+function sf(p){var o={};f.querySelectorAll('[name^="'+p+'__"]').forEach(function(e){var g=e.closest('[data-transport],[data-destination]');if(g&&g.style.display==='none')return;var k=e.name.split('__')[1];if(e.type==='checkbox'){if(e.checked)o[k]=true}else if(e.value!==''&&e.value!==undefined){var n=Number(e.value);o[k]=isNaN(n)?e.value:n}});return Object.keys(o).length?JSON.stringify(o):''}
+if(ts){var tgA=Array.from(f.querySelectorAll('.tc-group'));ts.addEventListener('change',function(){tg(ts,tgA,'transport')})}
+if(ds){var dgA=Array.from(f.querySelectorAll('.dc-group'));ds.addEventListener('change',function(){tg(ds,dgA,'destination')})}
+f.addEventListener('htmx:configRequest',function(){htc.value=sf('tc');hdc.value=sf('dc')});
+})();
+</script>
+</body>
+</html>

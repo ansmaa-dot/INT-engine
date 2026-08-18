@@ -2,13 +2,14 @@ import sqlite3
 from typing import List
 
 from core.message import Envelope
+from core.canonical_paths import resolve_path
 from nodes.base import EnrichmentNode
 
 
 class BatchLookup(EnrichmentNode):
     """Case 2 from the blueprint: resolves reference data (patient name,
     doctor id, test code...) for a whole batch of envelopes in one query,
-    instead of one query per message (the N+1 pattern that kills Mirth
+    instead of one query per message (the N+1 pattern that kills some engines
     channels under load).
 
     db_path defaults to the same reference DB the source system uses — point
@@ -18,7 +19,7 @@ class BatchLookup(EnrichmentNode):
     def __init__(self, db_path: str, source_key_field: str, target_table: str,
                  target_key_col: str, fields: List[str], lookup_name: str):
         self.db_path = db_path
-        self.source_key_field = source_key_field  # field name inside raw_payload
+        self.source_key_field = source_key_field  # field name inside the canonical message
         self.target_table = target_table
         self.target_key_col = target_key_col
         self.fields = fields
@@ -59,4 +60,8 @@ class BatchLookup(EnrichmentNode):
         return self.enrich_batch([envelope])[0]
 
     def _extract_key(self, env: Envelope):
-        return env.raw_payload.get(self.source_key_field) if isinstance(env.raw_payload, dict) else None
+        # Lookup keys are canonical paths into the canonical message (the
+        # pipeline currency) — never transport-specific payload shapes.
+        # ``env.canonical_dict`` is {} until the decode stage populates
+        # ``env.canonical``, which the runner does before enrichment runs.
+        return resolve_path(env.canonical_dict, self.source_key_field)

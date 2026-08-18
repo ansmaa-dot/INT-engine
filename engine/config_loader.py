@@ -1,37 +1,71 @@
-import json
-import os
-import sqlite3
-from glob import glob
+"""Channel configuration: declarative channels referencing reusable
+capabilities.
 
+A channel is orchestration ONLY:
+
+    Inbound Transport + Inbound Codec + [Enrichment ref] + [Mapping ref]
+  + Outbound Codec + Destination + Retry Policy ref [+ optional semantics]
+
+Reusable definitions live in dedicated tables with stable identity/versioning:
+
+  * mappings       — (mapping_id, version) -> JSON rules using canonical paths
+  * enrichments    — (enrichment_id, version) -> lookup definition
+  * retry_policies — retry_policy_id -> max_retries / base_backoff_seconds
+
+Editing a mapping/enrichment creates a NEW version row; channels pin a
+specific version, so a change never silently alters consumers unless they are
+explicitly repointed to the new version.
+
+Configuration validation is explicit and fail-fast. Unknown transports,
+codecs, or destinations, and missing mapping/enrichment/retry references are
+rejected at save/validate time — there is never a silent fallback (e.g. no
+implicit passthrough codec).
+"""
+import json
+import sqlite3
+from datetime import datetime, timezone
+
+from core.auth_manager import AuthManager
 from engine.runner import ChannelRunner
-from nodes.destination.mllp_client import MllpClientNode
+from nodes.codec import keys as codec_keys
 from nodes.destination.http_client import HttpClientNode
+from nodes.destination.mllp_client import MllpClientNode
 from nodes.destination.sftp_client import SFTPClientNode
-from nodes.transform.field_mapper import FieldMapper
 from nodes.enrichment.batch_lookup import BatchLookup
+from nodes.ingestion.db_poller import DBPoller
+from nodes.ingestion.file_watcher import FileWatcher
 from nodes.ingestion.http_poller import HTTPPoller
 from nodes.ingestion.mllp_server import MLLPServer
-from nodes.ingestion.file_watcher import FileWatcher
-from nodes.ingestion.db_poller import DBPoller
-from core.auth_manager import AuthManager
+from nodes.transform.field_mapper import FieldMapper
 
-# Columns added on top of the original MVP schema. Kept as a migration list
-# (rather than a fresh CREATE TABLE) so existing queue.db files upgrade in
-# place instead of needing to be deleted.
-_NEW_COLUMNS = {
-    "ingestion_type": "TEXT",       # None | "http_poller" | "http_webhook" | "mllp_server" | "file_watcher" | "db_poller"
-    "ingestion_config": "TEXT",     # JSON blob, shape depends on ingestion_type
-    "enrichment_config": "TEXT",    # JSON blob: {db_path, source_key_field, target_table, target_key_col, fields, lookup_name}
-    "concurrency": "INTEGER",       # worker threads draining this channel's queue concurrently (default 1)
-}
+# Explicit registries of supported transports / destinations. Adding a new
+# one is one entry here plus one builder branch below.
+TRANSPORTS = {"http_webhook", "mllp", "http_poller", "file_watcher", "db_poller"}
+DESTINATIONS = {"http", "mllp", "sftp"}
+
+
+class ConfigValidationError(ValueError):
+    """Raised when a channel/definition configuration is invalid."""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_text(obj) -> str | None:
+    if obj is None:
+        return None
+    if isinstance(obj, (dict, list)):
+        return json.dumps(obj, default=str)
+    return str(obj)
+
 
 _auth_manager: AuthManager | None = None
 
 
 def get_auth_manager() -> AuthManager:
     """Process-wide AuthManager singleton, loaded once from
-    config/auth_profiles.json. Never re-read per request — profiles rarely
-    change, and re-parsing on every send would be wasted work."""
+    config/auth_profiles.json."""
     global _auth_manager
     if _auth_manager is None:
         _auth_manager = AuthManager.from_file()
@@ -47,275 +81,532 @@ class ChannelConfigRegistry:
         self.configs = {}
         self.auth = get_auth_manager()
         self._ensure_schema()
-        self.seed_default_channels()
+        self.seed_defaults()
+
+    # --- schema ------------------------------------------------------------
 
     def _get_conn(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
         return conn
 
     def _ensure_schema(self):
         with self._get_conn() as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS channels (
                     channel_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     enabled INTEGER DEFAULT 1,
                     status TEXT DEFAULT 'running',
-                    type TEXT,
-                    retry_policy TEXT,
-                    mapping_rules TEXT,
-                    destination TEXT
+                    concurrency INTEGER DEFAULT 1,
+                    inbound_transport TEXT NOT NULL,
+                    inbound_transport_config TEXT,
+                    inbound_codec TEXT NOT NULL,
+                    outbound_codec TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    destination_config TEXT,
+                    mapping_id TEXT,
+                    mapping_version INTEGER,
+                    enrichment_id TEXT,
+                    enrichment_version INTEGER,
+                    retry_policy_id TEXT,
+                    semantics TEXT
                 )
-            """)
-            existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(channels)")}
-            for col, coltype in _NEW_COLUMNS.items():
-                if col not in existing_cols:
-                    conn.execute(f"ALTER TABLE channels ADD COLUMN {col} {coltype}")
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mappings (
+                    mapping_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    rules TEXT NOT NULL,
+                    description TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (mapping_id, version)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS enrichments (
+                    enrichment_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    source_key_field TEXT NOT NULL,
+                    lookup_db_path TEXT NOT NULL,
+                    target_table TEXT NOT NULL,
+                    target_key_col TEXT NOT NULL,
+                    fields TEXT NOT NULL,
+                    lookup_name TEXT NOT NULL,
+                    description TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (enrichment_id, version)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retry_policies (
+                    retry_policy_id TEXT PRIMARY KEY,
+                    max_retries INTEGER NOT NULL,
+                    base_backoff_seconds INTEGER NOT NULL,
+                    description TEXT
+                )
+                """
+            )
             conn.commit()
 
-    def seed_default_channels(self):
-        """Seed channels from legacy config files or defaults if database is empty."""
-        try:
-            with self._get_conn() as conn:
-                count = conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
-                if count > 0:
-                    return
+    def seed_defaults(self):
+        """Seeds a demo channel and the reusable definitions it references.
+        Only runs when the config tables are empty."""
+        with self._get_conn() as conn:
+            if conn.execute("SELECT COUNT(*) FROM retry_policies").fetchone()[0] == 0:
+                conn.execute(
+                    "INSERT INTO retry_policies (retry_policy_id, max_retries, base_backoff_seconds, description) VALUES (?, ?, ?, ?)",
+                    ("default", 3, 2, "default: 3 retries, 2s base backoff"),
+                )
+            if conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0] == 0:
+                conn.execute(
+                    "INSERT INTO mappings (mapping_id, version, rules, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("identity", 1, "[]", "identity mapping (no changes)", _now_iso(), _now_iso()),
+                )
+            if conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 0:
+                conn.execute(
+                    """
+                    INSERT INTO channels (channel_id, name, enabled, status, concurrency,
+                        inbound_transport, inbound_transport_config, inbound_codec, outbound_codec,
+                        destination, destination_config, mapping_id, mapping_version, retry_policy_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "his_to_lis", "HIS to LIS Pipeline", 1, "running", 1,
+                        "http_webhook", json.dumps({"sig_header": "X-Signature"}),
+                        "json", "json",
+                        "http", json.dumps({"endpoint_url": "http://localhost:5005/api/lis/orders", "method": "POST"}),
+                        "identity", 1, "default",
+                    ),
+                )
+            conn.commit()
+    # --- reusable definitions CRUD -----------------------------------------
 
-                seeded_any = False
-                config_dir = "configs"
-                if os.path.exists(config_dir):
-                    pattern = os.path.join(config_dir, "*.json")
-                    for filepath in glob(pattern):
-                        try:
-                            with open(filepath, "r") as f:
-                                config = json.load(f)
-                                channel_id = config.get("channel_id")
-                                if channel_id:
-                                    conn.execute("""
-                                        INSERT INTO channels
-                                            (channel_id, name, enabled, status, type, retry_policy,
-                                             mapping_rules, destination, ingestion_type, ingestion_config,
-                                             enrichment_config)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """, (
-                                        channel_id,
-                                        config.get("name", channel_id),
-                                        1 if config.get("enabled", True) else 0,
-                                        "running",
-                                        "HTTP Outbound" if config.get("destination", {}).get("type") == "http" else "MLLP Outbound",
-                                        json.dumps(config.get("retry_policy", {})),
-                                        json.dumps(config.get("mapping_rules", [])),
-                                        json.dumps(config.get("destination")) if config.get("destination") else None,
-                                        config.get("ingestion_type"),
-                                        json.dumps(config.get("ingestion_config")) if config.get("ingestion_config") else None,
-                                        json.dumps(config.get("enrichment_config")) if config.get("enrichment_config") else None,
-                                    ))
-                                    seeded_any = True
-                        except Exception as e:
-                            print(f"[Seed Error] Failed to seed from {filepath}: {e}")
-                    conn.commit()
+    def _next_version(self, table: str, id_col: str, ident: str) -> int:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                f"SELECT COALESCE(MAX(version), 0) AS v FROM {table} WHERE {id_col} = ?",
+                (ident,),
+            ).fetchone()
+            return int(row["v"]) + 1
 
-                if not seeded_any:
-                    conn.execute("""
-                        INSERT INTO channels
-                            (channel_id, name, enabled, status, type, retry_policy,
-                             mapping_rules, destination, ingestion_type, ingestion_config,
-                             enrichment_config)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        "his_to_lis",
-                        "HIS to LIS Pipeline",
-                        1,
-                        "running",
-                        "HTTP Webhook -> HTTP Outbound",
-                        json.dumps({"max_retries": 3, "base_backoff_seconds": 2}),
-                        json.dumps([
-                            {"source": "order_id", "target": "accession_num", "required": True},
-                            {"source": "doctor_username", "target": "doctor", "required": True, "fn": "Uppercase"},
-                            {"source": "test", "target": "test_code", "required": False}
-                        ]),
-                        json.dumps({"type": "http", "endpoint_url": "http://localhost:5005/api/lis/orders"}),
-                        "http_webhook",
-                        json.dumps({"shared_secret": None}),
-                        None,
-                    ))
-                conn.commit()
-        except Exception as e:
-            print(f"[Seed Error] Failed to run database seed check: {e}")
+    def save_retry_policy(self, retry_policy_id: str, max_retries: int,
+                          base_backoff_seconds: int, description: str = ""):
+        if not retry_policy_id:
+            raise ConfigValidationError("retry_policy_id is required")
+        if int(max_retries) < 0 or int(base_backoff_seconds) < 0:
+            raise ConfigValidationError("retry policy values must be >= 0")
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO retry_policies (retry_policy_id, max_retries, base_backoff_seconds, description)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(retry_policy_id) DO UPDATE SET
+                    max_retries = excluded.max_retries,
+                    base_backoff_seconds = excluded.base_backoff_seconds,
+                    description = excluded.description
+                """,
+                (retry_policy_id, int(max_retries), int(base_backoff_seconds), description),
+            )
+            conn.commit()
 
-    def load_all_configs(self) -> dict:
-        """Parses all channel configurations from the SQLite database."""
-        self.configs.clear()
-        try:
-            with self._get_conn() as conn:
-                rows = conn.execute("SELECT * FROM channels").fetchall()
-                for row in rows:
-                    channel_id = row["channel_id"]
-                    row_keys = row.keys()
+    def save_mapping(self, mapping_id: str, rules: list, description: str = "",
+                     version: int | None = None) -> int:
+        """Persists a new mapping version. Each save creates a new version row;
+        channels pin a specific version, so edits never silently alter
+        existing consumers."""
+        if not mapping_id:
+            raise ConfigValidationError("mapping_id is required")
+        if not isinstance(rules, list):
+            raise ConfigValidationError("mapping rules must be a JSON array")
+        if version is None:
+            version = self._next_version("mappings", "mapping_id", mapping_id)
+        now = _now_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT INTO mappings (mapping_id, version, rules, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (mapping_id, version, json.dumps(rules), description, now, now),
+            )
+            conn.commit()
+        return version
 
-                    def _load_json(col):
-                        if col not in row_keys or not row[col]:
-                            return None
-                        try:
-                            return json.loads(row[col])
-                        except Exception:
-                            return None
+    def save_enrichment(self, enrichment_id: str, source_key_field: str,
+                        lookup_db_path: str, target_table: str, target_key_col: str,
+                        fields: list, lookup_name: str, description: str = "",
+                        version: int | None = None) -> int:
+        if not enrichment_id:
+            raise ConfigValidationError("enrichment_id is required")
+        if not all([source_key_field, lookup_db_path, target_table, target_key_col]):
+            raise ConfigValidationError("enrichment requires source_key_field, lookup_db_path, target_table, target_key_col")
+        if not isinstance(fields, list):
+            raise ConfigValidationError("enrichment fields must be a JSON array")
+        if version is None:
+            version = self._next_version("enrichments", "enrichment_id", enrichment_id)
+        now = _now_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO enrichments (enrichment_id, version, source_key_field, lookup_db_path,
+                    target_table, target_key_col, fields, lookup_name, description, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (enrichment_id, version, source_key_field, lookup_db_path,
+                 target_table, target_key_col, json.dumps(fields), lookup_name,
+                 description, now, now),
+            )
+            conn.commit()
+        return version
 
-                    self.configs[channel_id] = {
-                        "channel_id": channel_id,
-                        "name": row["name"],
-                        "enabled": bool(row["enabled"]),
-                        "status": row["status"],
-                        "type": row["type"],
-                        "retry_policy": _load_json("retry_policy") or {},
-                        "mapping_rules": _load_json("mapping_rules") or [],
-                        "destination": _load_json("destination"),
-                        "ingestion_type": row["ingestion_type"] if "ingestion_type" in row_keys else None,
-                        "ingestion_config": _load_json("ingestion_config") or {},
-                        "enrichment_config": _load_json("enrichment_config"),
-                        "concurrency": (row["concurrency"] if "concurrency" in row_keys and row["concurrency"] else 1),
-                    }
-        except Exception as e:
-            print(f"[Config Error] Failed to load configs from database: {e}")
-        return self.configs
+    def list_mappings(self) -> list[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT mapping_id, version, description FROM mappings ORDER BY mapping_id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
-    def load_config(self, channel_id):
-        """Fetch/reload configs and return a specific channel configuration."""
-        all_configs = self.load_all_configs()
-        return all_configs.get(channel_id)
+    def list_enrichments(self) -> list[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT enrichment_id, version, description FROM enrichments ORDER BY enrichment_id, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
-    def build_runner(self, channel_id: str, queue) -> ChannelRunner:
-        """Instantiates a ChannelRunner using the channel's database configuration."""
+    def list_retry_policies(self) -> list[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT retry_policy_id, max_retries, base_backoff_seconds, description FROM retry_policies ORDER BY retry_policy_id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- channel CRUD ------------------------------------------------------
+
+    def save_channel_definition(self, definition: dict) -> None:
+        """Validates and persists a channel definition. Invalid definitions
+        raise ConfigValidationError and are never saved."""
+        errors = self.validate_channel_definition(definition)
+        if errors:
+            raise ConfigValidationError("; ".join(errors))
+
+        cid = definition["channel_id"]
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO channels (channel_id, name, enabled, status, concurrency,
+                    inbound_transport, inbound_transport_config, inbound_codec, outbound_codec,
+                    destination, destination_config, mapping_id, mapping_version,
+                    enrichment_id, enrichment_version, retry_policy_id, semantics)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    name = excluded.name, enabled = excluded.enabled, status = excluded.status,
+                    concurrency = excluded.concurrency,
+                    inbound_transport = excluded.inbound_transport,
+                    inbound_transport_config = excluded.inbound_transport_config,
+                    inbound_codec = excluded.inbound_codec, outbound_codec = excluded.outbound_codec,
+                    destination = excluded.destination, destination_config = excluded.destination_config,
+                    mapping_id = excluded.mapping_id, mapping_version = excluded.mapping_version,
+                    enrichment_id = excluded.enrichment_id, enrichment_version = excluded.enrichment_version,
+                    retry_policy_id = excluded.retry_policy_id, semantics = excluded.semantics
+                """,
+                (
+                    cid, definition["name"], 1 if definition.get("enabled", True) else 0,
+                    definition.get("status", "running"), int(definition.get("concurrency", 1)),
+                    definition["inbound_transport"],
+                    _json_text(definition.get("inbound_transport_config")),
+                    definition["inbound_codec"], definition["outbound_codec"],
+                    definition["destination"], _json_text(definition.get("destination_config")),
+                    definition.get("mapping_id"), definition.get("mapping_version"),
+                    definition.get("enrichment_id"), definition.get("enrichment_version"),
+                    definition.get("retry_policy_id"), _json_text(definition.get("semantics")),
+                ),
+            )
+            conn.commit()
         self.load_all_configs()
 
+    def delete_channel(self, channel_id: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+            conn.commit()
+        self.load_all_configs()
+
+    # --- validation --------------------------------------------------------
+
+    def _mapping_exists(self, mapping_id: str, version: int) -> bool:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM mappings WHERE mapping_id = ? AND version = ?", (mapping_id, version)
+            ).fetchone()
+        return row is not None
+
+    def _enrichment_exists(self, enrichment_id: str, version: int) -> bool:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM enrichments WHERE enrichment_id = ? AND version = ?",
+                (enrichment_id, version),
+            ).fetchone()
+        return row is not None
+
+    def _retry_exists(self, retry_policy_id: str) -> bool:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM retry_policies WHERE retry_policy_id = ?", (retry_policy_id,)
+            ).fetchone()
+        return row is not None
+
+    def validate_channel_definition(self, definition: dict) -> list[str]:
+        """Returns a list of validation errors (empty = valid). Unknown
+        transports/codecs/destinations and missing reusable-definition
+        references are rejected here, before runtime."""
+        errors = []
+        if not definition.get("channel_id"):
+            errors.append("channel_id is required")
+        if not definition.get("name"):
+            errors.append("name is required")
+
+        transport = definition.get("inbound_transport") or ""
+        if transport not in TRANSPORTS:
+            errors.append(f"unknown inbound transport: {transport!r}")
+
+        icodec = definition.get("inbound_codec") or ""
+        if icodec not in codec_keys():
+            errors.append(f"unknown inbound codec: {icodec!r} (must be an explicit registry key)")
+        ocodec = definition.get("outbound_codec") or ""
+        if ocodec not in codec_keys():
+            errors.append(f"unknown outbound codec: {ocodec!r} (must be an explicit registry key)")
+
+        dest = definition.get("destination") or ""
+        if dest not in DESTINATIONS:
+            errors.append(f"unknown destination: {dest!r}")
+
+        mapping_id = definition.get("mapping_id")
+        if mapping_id:
+            v = definition.get("mapping_version")
+            if not v:
+                errors.append("mapping_version is required when mapping_id is set")
+            elif not self._mapping_exists(mapping_id, int(v)):
+                errors.append(f"mapping {mapping_id!r} version {v} does not exist")
+
+        enrichment_id = definition.get("enrichment_id")
+        if enrichment_id:
+            v = definition.get("enrichment_version")
+            if not v:
+                errors.append("enrichment_version is required when enrichment_id is set")
+            elif not self._enrichment_exists(enrichment_id, int(v)):
+                errors.append(f"enrichment {enrichment_id!r} version {v} does not exist")
+
+        rp = definition.get("retry_policy_id")
+        if not rp:
+            errors.append("retry_policy_id is required")
+        elif not self._retry_exists(rp):
+            errors.append(f"retry policy {rp!r} does not exist")
+
+        tc = definition.get("inbound_transport_config") or {}
+        if transport == "mllp" and not tc.get("port"):
+            errors.append("mllp transport requires inbound_transport_config.port")
+        if transport == "http_poller" and not tc.get("url"):
+            errors.append("http_poller transport requires inbound_transport_config.url")
+        if transport == "file_watcher" and not tc.get("directory"):
+            errors.append("file_watcher transport requires inbound_transport_config.directory")
+        if transport == "db_poller" and (not tc.get("connection_string") or not tc.get("query")):
+            errors.append("db_poller transport requires inbound_transport_config.connection_string and query")
+
+        dc = definition.get("destination_config") or {}
+        if dest == "http" and not dc.get("endpoint_url"):
+            errors.append("http destination requires destination_config.endpoint_url")
+        if dest == "mllp" and (not dc.get("host") or not dc.get("port")):
+            errors.append("mllp destination requires destination_config.host and port")
+        if dest == "sftp" and not dc.get("host"):
+            errors.append("sftp destination requires destination_config.host")
+
+        return errors
+
+# --- load / build ------------------------------------------------------
+
+    def _parse_json(self, value, default=None):
+        if value is None:
+            return default
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _row_to_config(self, conn, row) -> dict:
+        config = dict(row)
+        config["inbound_transport_config"] = self._parse_json(row["inbound_transport_config"], {})
+        config["destination_config"] = self._parse_json(row["destination_config"], {})
+        config["semantics"] = self._parse_json(row["semantics"], None)
+
+        # resolve reusable references
+        config["mapping_rules"] = []
+        if row["mapping_id"] and row["mapping_version"]:
+            mrow = conn.execute(
+                "SELECT rules FROM mappings WHERE mapping_id = ? AND version = ?",
+                (row["mapping_id"], row["mapping_version"]),
+            ).fetchone()
+            if mrow:
+                config["mapping_rules"] = self._parse_json(mrow["rules"], [])
+
+        config["enrichment"] = None
+        if row["enrichment_id"] and row["enrichment_version"]:
+            erow = conn.execute(
+                "SELECT * FROM enrichments WHERE enrichment_id = ? AND version = ?",
+                (row["enrichment_id"], row["enrichment_version"]),
+            ).fetchone()
+            if erow:
+                config["enrichment"] = dict(erow)
+
+        config["retry_policy"] = {"max_retries": 3, "base_backoff_seconds": 2}
+        if row["retry_policy_id"]:
+            prow = conn.execute(
+                "SELECT max_retries, base_backoff_seconds FROM retry_policies WHERE retry_policy_id = ?",
+                (row["retry_policy_id"],),
+            ).fetchone()
+            if prow:
+                config["retry_policy"] = {
+                    "max_retries": prow["max_retries"],
+                    "base_backoff_seconds": prow["base_backoff_seconds"],
+                }
+
+        return config
+
+    def load_all_configs(self) -> dict:
+        configs = {}
+        with self._get_conn() as conn:
+            for row in conn.execute("SELECT * FROM channels").fetchall():
+                configs[row["channel_id"]] = self._row_to_config(conn, row)
+        self.configs = configs
+        return configs
+
+    def load_config(self, channel_id: str) -> dict | None:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM channels WHERE channel_id = ?", (channel_id,)).fetchone()
+        if not row:
+            return None
+        return self._row_to_config(conn, row)
+    # --- builders ----------------------------------------------------------
+
+    def _build_destination(self, config: dict):
+        dname = config["destination"]
+        dc = config.get("destination_config") or {}
+        if dname == "http":
+            return HttpClientNode(
+                endpoint_url=dc["endpoint_url"],
+                method=dc.get("method", "POST"),
+                auth=self.auth,
+                auth_profile_id=dc.get("auth_profile_id"),
+                headers=dc.get("headers"),
+                timeout=dc.get("timeout_s", 5),
+            )
+        if dname == "mllp":
+            return MllpClientNode(host=dc["host"], port=dc["port"])
+        if dname == "sftp":
+            return SFTPClientNode(
+                host=dc["host"],
+                port=dc.get("port", 22),
+                username=dc.get("username", ""),
+                password=dc.get("password"),
+                private_key_path=dc.get("private_key_path"),
+                private_key_passphrase=dc.get("private_key_passphrase"),
+                remote_dir=dc.get("remote_dir", "."),
+                timeout=dc.get("timeout_s", 10),
+            )
+        return None
+
+    def _build_enrichment(self, config: dict):
+        enr = config.get("enrichment")
+        if not enr:
+            return None
+        return BatchLookup(
+            db_path=enr["lookup_db_path"],
+            source_key_field=enr["source_key_field"],
+            target_table=enr["target_table"],
+            target_key_col=enr["target_key_col"],
+            fields=self._parse_json(enr["fields"], []),
+            lookup_name=enr["lookup_name"],
+        )
+
+    def build_runner(self, channel_id: str, queue, destination=None) -> ChannelRunner:
+        """Instantiates a ChannelRunner for a channel from its declarative
+        references. Validates the config first — invalid channels fail here,
+        before runtime. `destination` may override the configured destination
+        (test seam)."""
+        self.load_all_configs()
         config = self.configs.get(channel_id)
         if not config:
-            raise ValueError(f"No configuration found for channel: {channel_id}")
+            raise ConfigValidationError(f"no channel configuration for {channel_id!r}")
+        errors = self.validate_channel_definition(config)
+        if errors:
+            raise ConfigValidationError("; ".join(errors))
 
-        mapper = FieldMapper(config.get("mapping_rules", []))
-        destination = self.build_destination(config.get("destination"))
-        enricher = self.build_enrichment(config.get("enrichment_config"))
-
-        retry_policy = config.get("retry_policy", {})
-        max_retries = retry_policy.get("max_retries", 3)
-        base_backoff = retry_policy.get("base_backoff_seconds", 2)
+        mapper = FieldMapper(config.get("mapping_rules", [])) if config.get("mapping_id") else None
+        enricher = self._build_enrichment(config)
+        rp = config.get("retry_policy") or {}
 
         return ChannelRunner(
             channel_id=channel_id,
             queue=queue,
             mapper=mapper,
-            destination=destination,
+            destination=destination if destination is not None else self._build_destination(config),
             enricher=enricher,
-            max_retries=max_retries,
-            base_backoff=base_backoff,
-        )
-
-    def build_destination(self, dest_config: dict):
-        if not dest_config:
-            return None
-        dest_type = dest_config.get("type")
-        if dest_type == "http":
-            return HttpClientNode(
-                endpoint_url=dest_config.get("endpoint_url"),
-                method=dest_config.get("method", "POST"),
-                auth=self.auth,
-                auth_profile_id=dest_config.get("auth_profile_id"),
-                timeout=dest_config.get("timeout_s", 5),
-            )
-        elif dest_type == "mllp":
-            return MllpClientNode(
-                host=dest_config.get("host"),
-                port=dest_config.get("port"),
-            )
-        elif dest_type == "sftp":
-            return SFTPClientNode(
-                host=dest_config.get("host"),
-                port=dest_config.get("port", 22),
-                username=dest_config.get("username", ""),
-                password=dest_config.get("password"),
-                private_key_path=dest_config.get("private_key_path"),
-                private_key_passphrase=dest_config.get("private_key_passphrase"),
-                remote_dir=dest_config.get("remote_dir", "."),
-                filename_field=dest_config.get("filename_field"),
-                content_field=dest_config.get("content_field"),
-                timeout=dest_config.get("timeout_s", 10),
-            )
-        return None
-
-    def build_enrichment(self, enrichment_config: dict | None):
-        if not enrichment_config:
-            return None
-        return BatchLookup(
-            db_path=enrichment_config.get("db_path", self.db_path),
-            source_key_field=enrichment_config["source_key_field"],
-            target_table=enrichment_config["target_table"],
-            target_key_col=enrichment_config["target_key_col"],
-            fields=enrichment_config["fields"],
-            lookup_name=enrichment_config.get("lookup_name", "lookup"),
+            inbound_codec=config["inbound_codec"],
+            outbound_codec=config["outbound_codec"],
+            max_retries=rp.get("max_retries", 3),
+            base_backoff=rp.get("base_backoff_seconds", 2),
         )
 
     def build_ingestion(self, channel_id: str, queue):
-        """Builds an active ingestion node for channels with an ingestion_type
-        that runs as a background thread ('http_poller', 'mllp_server',
-        'file_watcher'). 'http_webhook' channels aren't built here — they're
-        registered onto the shared Flask app's WebhookRegistry instead (see
-        api/app.py), since a webhook needs to live on the running web server,
-        not a background worker thread."""
+        """Builds an active ingestion node for background transports
+        ('mllp', 'http_poller', 'file_watcher', 'db_poller'). 'http_webhook'
+        channels aren't built here — webhooks live on the shared Flask app's
+        WebhookRegistry (see api/app.py)."""
         config = self.configs.get(channel_id)
         if not config:
             return None
-        itype = config.get("ingestion_type")
-        icfg = config.get("ingestion_config") or {}
-        max_queue_depth = icfg.get("max_queue_depth")
-        idempotency_key_field = icfg.get("idempotency_key_field")
+        transport = config.get("inbound_transport")
+        if transport == "http_webhook":
+            return None
+        tc = config.get("inbound_transport_config") or {}
+        max_queue_depth = tc.get("max_queue_depth")
 
-        if itype == "http_poller":
+        if transport == "http_poller":
             return HTTPPoller(
-                url=icfg["url"],
-                channel_id=channel_id,
-                queue=queue,
-                auth=self.auth,
-                auth_profile_id=icfg.get("auth_profile_id"),
-                interval_s=icfg.get("interval_s", 10),
-                records_path=icfg.get("records_path", ""),
-                cursor_param=icfg.get("cursor_param"),
-                cursor_field=icfg.get("cursor_field"),
-                max_queue_depth=max_queue_depth,
-                idempotency_key_field=idempotency_key_field,
+                url=tc["url"], channel_id=channel_id, queue=queue, auth=self.auth,
+                auth_profile_id=tc.get("auth_profile_id"),
+                interval_s=tc.get("interval_s", 10), max_queue_depth=max_queue_depth,
+                idempotency_key_field=tc.get("idempotency_key_field"),
             )
-        elif itype == "mllp_server":
+        if transport == "mllp":
             return MLLPServer(
-                host=icfg.get("host", "0.0.0.0"),
-                port=icfg["port"],
-                channel_id=channel_id,
-                queue=queue,
-                max_connections=icfg.get("max_connections", 20),
-                idle_timeout_s=icfg.get("idle_timeout_s", 300),
-                max_queue_depth=max_queue_depth,
-                idempotency_from_msh10=bool(idempotency_key_field),
+                host=tc.get("host", "0.0.0.0"), port=tc["port"], channel_id=channel_id,
+                queue=queue, max_connections=tc.get("max_connections", 20),
+                idle_timeout_s=tc.get("idle_timeout_s", 300), max_queue_depth=max_queue_depth,
+                idempotency_from_msh10=bool(tc.get("idempotency_from_msh10")),
             )
-        elif itype == "file_watcher":
+        if transport == "file_watcher":
             return FileWatcher(
-                directory=icfg["directory"],
-                channel_id=channel_id,
-                queue=queue,
-                interval_s=icfg.get("interval_s", 5),
-                extensions=tuple(icfg.get("extensions", [".csv", ".hl7", ".txt"])),
+                directory=tc["directory"], channel_id=channel_id, queue=queue,
+                interval_s=tc.get("interval_s", 5),
+                extensions=tuple(tc.get("extensions", [".csv", ".hl7", ".txt"])),
                 max_queue_depth=max_queue_depth,
-                csv_mode=icfg.get("csv_mode", "auto"),
             )
-        elif itype == "db_poller":
+        if transport == "db_poller":
             return DBPoller(
-                connection_string=icfg["connection_string"],
-                query=icfg["query"],
-                channel_id=channel_id,
-                queue=queue,
-                db_type=icfg.get("db_type", "sqlite"),
-                interval_s=icfg.get("interval_s", 10),
-                cursor_field=icfg.get("cursor_field"),
-                cursor_param=icfg.get("cursor_param"),
+                connection_string=tc["connection_string"], query=tc["query"],
+                channel_id=channel_id, queue=queue,
+                db_type=tc.get("db_type", "sqlite"), interval_s=tc.get("interval_s", 10),
+                cursor_field=tc.get("cursor_field"), cursor_param=tc.get("cursor_param"),
                 max_queue_depth=max_queue_depth,
-                idempotency_key_field=idempotency_key_field,
+                idempotency_key_field=tc.get("idempotency_key_field"),
             )
         return None
