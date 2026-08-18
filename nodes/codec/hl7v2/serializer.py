@@ -39,7 +39,10 @@ def serialize_message(canonical: CanonicalMessage, profile: str = "ORU_R01") -> 
         lines.append(_pv1(canonical.encounter))
     if profile == "ADT_A01":
         lines.append("EVN|A01||")
-    if canonical.order is not None:
+    order = canonical.order
+    if profile == "ORM_O01":
+        lines.append(_orc(order) if order is not None else "ORC|NW|||")
+    if order is not None:
         lines.append(_obr(canonical.order))
     for spec in canonical.specimen:
         lines.append(_spm(spec))
@@ -53,6 +56,8 @@ def _msh(canonical: CanonicalMessage, profile: str) -> str:
     message_type = (meta.message_type or profile.replace("_", "^"))
     if profile == "ADT_A01":
         message_type = "ADT^A01"
+    if profile == "ORM_O01":
+        message_type = "ORM^O01"
     control_id = meta.message_id or "INTENGINE-1"
     version = meta.version or "2.5.1"
     # indices: 0=MSH 1=enc 2=sendapp 3..5 empty 6=MSH-7 dt 7=empty
@@ -86,6 +91,26 @@ def _pv1(encounter: Encounter) -> str:
     if encounter.visit_number is not None:
         fields[19] = escape(encounter.visit_number.value)
     return "|".join(fields)
+def _orc(order: Order) -> str:
+    """Build ORC segment for ORM messages."""
+    fields = ["ORC"] + [""] * 27
+    fields[1] = "NW"  # ORC-1 order control: new order
+    placer = next((i for i in order.identifiers if i.type == "PLACER"), None)
+    filler = order.accession or next((i for i in order.identifiers if i.type == "FILLER"), None)
+    if placer is not None:
+        fields[2] = _f(placer.value, placer.system or "")       # ORC-2
+    if filler is not None:
+        fields[3] = _f(filler.value, filler.system or "")       # ORC-3
+    if order.items:
+        code = order.items[0].code
+        if code is not None:
+            fields[4] = _f(code.value, "", _coding_system(code))  # ORC-4
+    fields[7] = _dtstr(order.requested_at)                      # ORC-7
+    if order.ordering_provider is not None:
+        fields[16] = escape(order.ordering_provider.value)      # ORC-16
+    return "|".join(fields)
+
+
 def _obr(order: Order) -> str:
     fields = ["OBR"] + [""] * 27  # indices 0..27 (OBR-28)
     fields[1] = "1"  # OBR-1 set id

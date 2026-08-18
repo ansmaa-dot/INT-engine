@@ -16,6 +16,8 @@ register(JsonCodec())
 register(PassthroughCodec())
 register(Hl7V2Codec(profile="ORU_R01", key="hl7v2.5.1.ORU_R01"))
 register(Hl7V2Codec(profile="ADT_A01", key="hl7v2.5.1.ADT_A01"))
+register(Hl7V2Codec(profile="ORM_O01", key="hl7v2.5.1.ORM_O01"))
+register(Hl7V2Codec(profile="UNDEFINED", key="hl7v2.5.1.UNDEFINED"))
 register(FhirR4Codec(key="fhir.r4"))
 
 __all__ = [

@@ -390,13 +390,8 @@
     <header>
         <h1><span>&#9881;</span> Integration Engine Dashboard</h1>
         <div style="display: flex; align-items: center; gap: 12px;">
-            <button class="btn btn-primary"
-                    hx-post="/ui/test/simulate"
-                    hx-target=".metric-grid">
-                + Inject Test Payloads
-            </button>
-            <div class="status-tag">
-                Engine: <strong>ONLINE</strong> (SQLite WAL) &nbsp;|&nbsp; Health: <strong>OK</strong>
+            <div class="status-tag" hx-get="/health" hx-trigger="load, every 5s">
+                Engine: <strong>--</strong> &nbsp;|&nbsp; Channels: <strong>--</strong>
             </div>
         </div>
     </header>

@@ -27,7 +27,8 @@ class HTTPPoller(IngestionNode):
                  auth_profile_id: str | None = None, interval_s: float = 10,
                  records_path: str = "", cursor_param: str | None = None,
                  cursor_field: str | None = None, max_queue_depth: int | None = None,
-                 idempotency_key_field: str | None = None):
+                 idempotency_key_field: str | None = None,
+                 inbound_codec: str = "json"):
         if interval_s < 5:
             raise ValueError("interval_s must be >= 5")
         self.url = url
@@ -41,6 +42,7 @@ class HTTPPoller(IngestionNode):
         self.cursor_field = cursor_field
         self.max_queue_depth = max_queue_depth
         self.idempotency_key_field = idempotency_key_field
+        self.inbound_codec = inbound_codec
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -83,4 +85,4 @@ class HTTPPoller(IngestionNode):
             source=self.channel_id,
             content_type=resp.headers.get("Content-Type"),
         )
-        self.queue.enqueue(to_envelope(self.channel_id, msg))
+        self.queue.enqueue(to_envelope(self.channel_id, msg, self.inbound_codec))

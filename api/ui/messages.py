@@ -19,11 +19,60 @@ def channel_messages_page(channel_id):
             response='<h1 style="padding:20px;">Channel not found</h1>'
                      '<p style="padding:0 20px;"><a href="/">Back to Dashboard</a></p>',
         )
+    from api.ui.helpers import codec_label
+    from api.ui.channels import _TRANSPORT_LABELS, _DEST_LABELS
+
+    inbound_transport = info.get("inbound_transport", "unknown")
+    inbound_codec = info.get("inbound_codec", "unknown")
+    outbound_codec = info.get("outbound_codec", "unknown")
+    destination = info.get("destination", "unknown")
+    concurrency = info.get("concurrency", 1)
+    retry_policy_id = info.get("retry_policy_id", "default")
+
+    transport_label = _TRANSPORT_LABELS.get(inbound_transport, inbound_transport)
+    dest_label = _DEST_LABELS.get(destination, destination)
+    in_codec_label = codec_label(inbound_codec)
+    out_codec_label = codec_label(outbound_codec)
+
+    # Build a one-line summary of the transport config
+    tc = info.get("inbound_transport_config") or {}
+    dc = info.get("destination_config") or {}
+    transport_detail = ""
+    if inbound_transport == "mllp":
+        transport_detail = f"{tc.get('host', '0.0.0.0')}:{tc.get('port', '?')}"
+    elif inbound_transport == "http_webhook":
+        transport_detail = f"POST /webhooks/{channel_id}"
+    elif inbound_transport == "http_poller":
+        transport_detail = tc.get("url", "?")
+    elif inbound_transport == "file_watcher":
+        transport_detail = tc.get("directory", "?")
+    elif inbound_transport == "db_poller":
+        transport_detail = tc.get("connection_string", "?")
+    dest_detail = ""
+    if destination == "http":
+        dest_detail = dc.get("endpoint_url", "?")
+    elif destination == "mllp":
+        dest_detail = f"{dc.get('host', '?')}:{dc.get('port', '?')}"
+    elif destination == "sftp":
+        dest_detail = f"{dc.get('host', '?')}:{dc.get('port', 22)}"
+
     return render_template(
         "channel_messages.html",
         channel_id=channel_id,
         channel_name=info.get("name", channel_id),
         channel_status=info.get("status", "running"),
+        inbound_transport=inbound_transport,
+        transport_label=transport_label,
+        transport_detail=transport_detail,
+        inbound_codec=inbound_codec,
+        in_codec_label=in_codec_label,
+        outbound_codec=outbound_codec,
+        out_codec_label=out_codec_label,
+        destination=destination,
+        dest_label=dest_label,
+        dest_detail=dest_detail,
+        concurrency=concurrency,
+        retry_policy_id=retry_policy_id,
     )
 
 

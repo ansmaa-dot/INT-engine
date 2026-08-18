@@ -65,10 +65,21 @@ def create_app() -> Flask:
 
     @app.route("/health")
     def health():
+        from flask import request
         configs = _registry.load_all_configs()
         running = sum(1 for c in configs.values()
                       if c.get("enabled", True) and c.get("status") == "running")
-        return jsonify({"status": "ok", "channels_running": running})
+        age = _queue.get_heartbeat_age_s()
+        if age is None:
+            engine_status = "OFFLINE"
+        elif age < 10:
+            engine_status = "ONLINE"
+        else:
+            engine_status = f"STALE ({int(age)}s)"
+        if request.headers.get("HX-Request"):
+            color = "#16a34a" if engine_status == "ONLINE" else "#dc2626"
+            return f'Engine: <strong style="color:{color}">{engine_status}</strong> &nbsp;|&nbsp; Channels: <strong>{running}</strong>'
+        return jsonify({"status": "ok", "channels_running": running, "engine": engine_status})
 
     return app
 

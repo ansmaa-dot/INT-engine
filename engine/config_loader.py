@@ -579,12 +579,15 @@ class ChannelConfigRegistry:
         tc = config.get("inbound_transport_config") or {}
         max_queue_depth = tc.get("max_queue_depth")
 
+        inbound_codec = config.get("inbound_codec", "json")
+
         if transport == "http_poller":
             return HTTPPoller(
                 url=tc["url"], channel_id=channel_id, queue=queue, auth=self.auth,
                 auth_profile_id=tc.get("auth_profile_id"),
                 interval_s=tc.get("interval_s", 10), max_queue_depth=max_queue_depth,
                 idempotency_key_field=tc.get("idempotency_key_field"),
+                inbound_codec=inbound_codec,
             )
         if transport == "mllp":
             return MLLPServer(
@@ -592,6 +595,7 @@ class ChannelConfigRegistry:
                 queue=queue, max_connections=tc.get("max_connections", 20),
                 idle_timeout_s=tc.get("idle_timeout_s", 300), max_queue_depth=max_queue_depth,
                 idempotency_from_msh10=bool(tc.get("idempotency_from_msh10")),
+                inbound_codec=inbound_codec,
             )
         if transport == "file_watcher":
             return FileWatcher(
@@ -599,6 +603,7 @@ class ChannelConfigRegistry:
                 interval_s=tc.get("interval_s", 5),
                 extensions=tuple(tc.get("extensions", [".csv", ".hl7", ".txt"])),
                 max_queue_depth=max_queue_depth,
+                inbound_codec=inbound_codec,
             )
         if transport == "db_poller":
             return DBPoller(
@@ -608,5 +613,6 @@ class ChannelConfigRegistry:
                 cursor_field=tc.get("cursor_field"), cursor_param=tc.get("cursor_param"),
                 max_queue_depth=max_queue_depth,
                 idempotency_key_field=tc.get("idempotency_key_field"),
+                inbound_codec=inbound_codec,
             )
         return None

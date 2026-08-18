@@ -121,8 +121,11 @@ def main():
 
     threading.Thread(target=_reclaim_loop, daemon=True, name="reclaim-loop").start()
 
+    heartbeat_queue = PersistentQueue("queue.db")
+
     while True:
         try:
+            heartbeat_queue.update_heartbeat()
             configs = registry.load_all_configs()
             for cid, conf in configs.items():
                 if conf.get("enabled", True):

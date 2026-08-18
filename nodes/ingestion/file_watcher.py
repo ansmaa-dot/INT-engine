@@ -25,7 +25,8 @@ class FileWatcher(IngestionNode):
 
     def __init__(self, directory: str, channel_id: str, queue,
                  interval_s: float = 5, extensions: tuple = (".csv", ".hl7", ".txt"),
-                 max_queue_depth: int | None = None, csv_mode: str = "auto"):
+                 max_queue_depth: int | None = None, csv_mode: str = "auto",
+                 inbound_codec: str = "json"):
         if interval_s < 1:
             raise ValueError("interval_s must be >= 1")
         self.directory = directory
@@ -35,6 +36,7 @@ class FileWatcher(IngestionNode):
         self.extensions = tuple(e.lower() for e in extensions)
         self.max_queue_depth = max_queue_depth
         self.csv_mode = csv_mode  # retained for config compatibility, unused
+        self.inbound_codec = inbound_codec
 
         self.processed_dir = os.path.join(directory, "processed")
         self.failed_dir = os.path.join(directory, "failed")
@@ -108,7 +110,7 @@ class FileWatcher(IngestionNode):
                 source=self.channel_id,
                 filename=fname,
             )
-            self.queue.enqueue(to_envelope(self.channel_id, msg))
+            self.queue.enqueue(to_envelope(self.channel_id, msg, self.inbound_codec))
             shutil.move(claimed_path, os.path.join(self.processed_dir, fname))
         except Exception as e:
             print(f"[FileWatcher:{self.channel_id}] failed to process {fname}: {e}", flush=True)

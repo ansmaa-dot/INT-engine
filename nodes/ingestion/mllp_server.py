@@ -27,13 +27,15 @@ class MLLPServer(IngestionNode):
     def __init__(self, host: str, port: int, channel_id: str, queue,
                  max_connections: int = 20, idle_timeout_s: int = 300,
                  max_queue_depth: int | None = None,
-                 idempotency_from_msh10: bool = False):
+                 idempotency_from_msh10: bool = False,
+                 inbound_codec: str = "json"):
         self.host = host
         self.port = port
         self.channel_id = channel_id
         self.queue = queue
         self.max_queue_depth = max_queue_depth
         self.idempotency_from_msh10 = idempotency_from_msh10
+        self.inbound_codec = inbound_codec
 
         self._sem = threading.Semaphore(max_connections)
         self.idle_timeout_s = idle_timeout_s
@@ -125,7 +127,7 @@ class MLLPServer(IngestionNode):
             source=self.channel_id,
             message_id=control_id if self.idempotency_from_msh10 else None,
         )
-        accepted = self.queue.enqueue(to_envelope(self.channel_id, msg))  # persisted BEFORE the ACK goes out
+        accepted = self.queue.enqueue(to_envelope(self.channel_id, msg, self.inbound_codec))  # persisted BEFORE the ACK goes out
         if not accepted:
             # duplicate message control ID — already processed, ACK success
             # anyway so the sender doesn't spin retrying a message we've

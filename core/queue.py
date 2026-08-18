@@ -80,6 +80,12 @@ class PersistentQueue:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_log (trace_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_channel_state ON queue (channel_id, state)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS heartbeat (
+                    id INTEGER PRIMARY KEY,
+                    last_beat_at TEXT NOT NULL
+                )
+            """)
             conn.commit()
 
     # --- idempotency -----------------------------------------------------
@@ -312,6 +318,25 @@ class PersistentQueue:
                 "SELECT COUNT(*) FROM queue WHERE channel_id = ? AND UPPER(state) = 'QUEUED'",
                 (channel_id,),
             ).fetchone()[0]
+
+    def update_heartbeat(self) -> None:
+        """Called by the worker daemon to signal it's alive."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO heartbeat (id, last_beat_at) VALUES (1, ?)",
+                (now_iso,),
+            )
+            conn.commit()
+
+    def get_heartbeat_age_s(self) -> float | None:
+        """Returns seconds since the last heartbeat, or None if never set."""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT last_beat_at FROM heartbeat WHERE id = 1").fetchone()
+        if not row or not row["last_beat_at"]:
+            return None
+        last = datetime.fromisoformat(row["last_beat_at"])
+        return (datetime.now(timezone.utc) - last).total_seconds()
 
     def reclaim_stale_processing(self, older_than_seconds: int = 120) -> int:
         """If a worker crashes between claiming a message (PROCESSING) and

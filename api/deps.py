@@ -40,6 +40,7 @@ def sync_webhooks() -> None:
                 sig_header=icfg.get("sig_header", "X-Signature"),
                 max_queue_depth=icfg.get("max_queue_depth"),
                 idempotency_key_field=icfg.get("idempotency_key_field"),
+                inbound_codec=conf.get("inbound_codec", "json"),
             )
             live_ids.add(cid)
     for cid in list(webhooks._channels.keys()):

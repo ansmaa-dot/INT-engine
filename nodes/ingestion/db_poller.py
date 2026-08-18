@@ -20,7 +20,8 @@ class DBPoller(IngestionNode):
                  cursor_field: str | None = None,
                  cursor_param: str | None = None,
                  max_queue_depth: int | None = None,
-                 idempotency_key_field: str | None = None):
+                 idempotency_key_field: str | None = None,
+                 inbound_codec: str = "json"):
         if interval_s < 5:
             raise ValueError("interval_s must be >= 5")
         self.connection_string = connection_string
@@ -33,6 +34,7 @@ class DBPoller(IngestionNode):
         self.cursor_param = cursor_param
         self.max_queue_depth = max_queue_depth
         self.idempotency_key_field = idempotency_key_field
+        self.inbound_codec = inbound_codec
         self._cursor = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -99,6 +101,6 @@ class DBPoller(IngestionNode):
                 source=self.channel_id,
                 message_id=message_id,
             )
-            self.queue.enqueue(to_envelope(self.channel_id, msg))
+            self.queue.enqueue(to_envelope(self.channel_id, msg, self.inbound_codec))
             if self.cursor_field and isinstance(row, dict):
                 self._cursor = row.get(self.cursor_field, self._cursor)

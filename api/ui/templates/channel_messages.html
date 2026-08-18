@@ -265,6 +265,22 @@
         </div>
     </header>
 
+    <div class="section-box" style="margin-bottom:12px;">
+        <div class="section-header-row">
+            <h2 style="border-bottom:none;">Channel Configuration</h2>
+        </div>
+        <div class="section-body" style="padding:10px 16px;">
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px 20px; font-size:12px;">
+                <div><span style="color:var(--text-muted);">Inbound:</span> <strong>{{ transport_label }}</strong>{% if transport_detail %} <code style="font-size:10px;color:#64748b;">{{ transport_detail }}</code>{% endif %}</div>
+                <div><span style="color:var(--text-muted);">In Codec:</span> <strong>{{ in_codec_label }}</strong></div>
+                <div><span style="color:var(--text-muted);">Concurrency:</span> <strong>{{ concurrency }}</strong></div>
+                <div><span style="color:var(--text-muted);">Outbound:</span> <strong>{{ dest_label }}</strong>{% if dest_detail %} <code style="font-size:10px;color:#64748b;">{{ dest_detail }}</code>{% endif %}</div>
+                <div><span style="color:var(--text-muted);">Out Codec:</span> <strong>{{ out_codec_label }}</strong></div>
+                <div><span style="color:var(--text-muted);">Retry Policy:</span> <strong>{{ retry_policy_id }}</strong></div>
+            </div>
+        </div>
+    </div>
+
     <div class="section-box">
         <div class="section-header-row">
             <h2 style="border-bottom:none;">Recent Messages</h2>

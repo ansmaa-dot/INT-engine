@@ -26,12 +26,14 @@ class WebhookRegistry:
 
     def register(self, channel_id: str, shared_secret: str | None = None,
                  sig_header: str = "X-Signature", max_queue_depth: int | None = None,
-                 idempotency_key_field: str | None = None):
+                 idempotency_key_field: str | None = None,
+                 inbound_codec: str = "json"):
         self._channels[channel_id] = {
             "secret": shared_secret,
             "sig_header": sig_header,
             "max_queue_depth": max_queue_depth,
             "idempotency_key_field": idempotency_key_field,
+            "inbound_codec": inbound_codec,
         }
 
     def unregister(self, channel_id: str):
@@ -68,7 +70,7 @@ class WebhookRegistry:
             source=channel_id,
             content_type=request.content_type,
         )
-        env = to_envelope(channel_id, msg)
+        env = to_envelope(channel_id, msg, cfg.get("inbound_codec", "json"))
 
         accepted = self.queue.enqueue(env)
         if not accepted:
