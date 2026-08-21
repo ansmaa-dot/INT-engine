@@ -19,8 +19,14 @@
   <textarea name="{{ fid }}" class="cf-input cf-ta" rows="3" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>{{ val }}</textarea>
 </label>
 {%- elif f.ftype == 'password' -%}
+{#- Never echo a stored secret back into the page. If a value already
+    exists, leave the input blank with a placeholder saying so; the backend
+    keeps the old value on save unless the user types a new one. -#}
 <label class="cf-label">{{ f.label }}
-  <input type="password" name="{{ fid }}" class="cf-input" value="{{ val }}" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>
+  <input type="password" name="{{ fid }}" class="cf-input"
+         placeholder="{{ '•••••• (leave blank to keep unchanged)' if val else f.placeholder }}"
+         {% if f.required and not val %} required{% endif %}
+         autocomplete="new-password">
 </label>
 {%- else -%}
 <label class="cf-label">{{ f.label }}
@@ -29,17 +35,59 @@
 {%- endif -%}
 {% endmacro %}
 
-<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Channel Editor</title></head>
-<body style="margin:0;padding:0;background:transparent;">
+<form hx-post="/ui/channels/save" hx-target="#editor-container" hx-swap="innerHTML"
+      class="channel-form" id="channel-form" novalidate>
 
-<form hx-post="/ui/channels/save" hx-target="#editor-container" hx-swap="innerHTML" class="channel-form" id="channel-form" novalidate>
+{% if flash_errors %}
+<div class="cf-flash cf-flash-error" id="cf-flash">
+  <div class="cf-flash-inner">
+    <span class="cf-flash-icon">⚠️</span>
+    <div class="cf-flash-msg">
+      <strong>Validation Error{{ 's' if flash_errors|length > 1 else '' }}:</strong>
+      {% if flash_errors|length == 1 %}
+        {{ flash_errors[0] }}
+      {% else %}
+        <ul style="margin:4px 0 0;padding-left:18px;">{% for e in flash_errors %}<li>{{ e }}</li>{% endfor %}</ul>
+      {% endif %}
+    </div>
+    <button type="button" class="cf-flash-close" onclick="this.closest('.cf-flash').remove()" title="Dismiss">×</button>
+  </div>
+</div>
+{% endif %}
+{% if flash_success %}
+<div class="cf-flash cf-flash-success" id="cf-flash">
+  <div class="cf-flash-inner">
+    <span class="cf-flash-icon">✓</span>
+    <div class="cf-flash-msg">{{ flash_success }}</div>
+    <button type="button" class="cf-flash-close" onclick="this.closest('.cf-flash').remove()" title="Dismiss">×</button>
+  </div>
+</div>
+{% endif %}
 
-  <div class="cf-header">
-    <span class="cf-header-icon">&#9881;</span>
-    <span>{{ 'Edit' if config.channel_id else 'New' }} Channel</span>
-    {% if config.channel_id %}<code class="cf-header-id">{{ config.channel_id }}</code>{% endif %}
+  {#- CSRF token: required if you adopt Flask-WTF. If you're not using
+      Flask-WTF, remove this line and the server-side validate_csrf() call
+      in save_channel(). -#}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <!-- Pipeline flow diagram -->
+  <div class="cf-flow" id="cf-flow">
+    <div class="cf-flow-stage" data-flow="source">
+      <span class="cf-flow-icon">📥</span>
+      <span class="cf-flow-label">Source</span>
+      <span class="cf-flow-sublabel">Step 2</span>
+    </div>
+    <span class="cf-flow-arrow" data-flow="arrow1">→</span>
+    <div class="cf-flow-stage" data-flow="pipeline">
+      <span class="cf-flow-icon">⚙️</span>
+      <span class="cf-flow-label">Pipeline</span>
+      <span class="cf-flow-sublabel">Step 3</span>
+    </div>
+    <span class="cf-flow-arrow" data-flow="arrow2">→</span>
+    <div class="cf-flow-stage" data-flow="destination">
+      <span class="cf-flow-icon">📤</span>
+      <span class="cf-flow-label">Destination</span>
+      <span class="cf-flow-sublabel">Step 4</span>
+    </div>
   </div>
 
   <!-- Tab bar -->
@@ -100,7 +148,7 @@
 
     <fieldset class="cf-section">
       <legend>Connection</legend>
-      <p class="cf-hint">Fields shown depend on the transport selected above.</p>
+      <p class="cf-hint">Fields shown depend on the transport selected above. Only the visible group is saved.</p>
       <div id="transport-fields">
         {% for tgroup in transport_groups %}
         <div class="tc-group cf-card" data-transport="{{ tgroup.transport }}"
@@ -117,10 +165,11 @@
 
   <!-- STEP 2: Pipeline -->
   <div class="cf-step" data-step="2">
+    <p class="cf-help">The pipeline processes each message: decode inbound format, apply transformations, enrich with external data, encode to outbound format, then deliver.</p>
     <fieldset class="cf-section">
       <legend>Encoding &amp; Transformation</legend>
       <label class="cf-label">Outbound Codec <span class="cf-req">*</span>
-        <select name="outbound_codec" class="cf-input">
+        <select name="outbound_codec" class="cf-input" title="The format to encode the message into before delivery (e.g. JSON, HL7 v2, FHIR)">
           {% for c in outbound_codecs %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}
         </select>
       </label>
@@ -128,27 +177,28 @@
 
     <fieldset class="cf-section">
       <legend>References</legend>
+      <p class="cf-hint">Optional: attach a Mapping to reshape fields, and/or an Enrichment to look up additional data.</p>
       <div class="cf-row cols-2">
         <div>
           <label class="cf-label">Mapping
-            <select name="mapping_id" class="cf-input">
+            <select name="mapping_id" class="cf-input" title="Transform field names and values (e.g. rename, reformat, compute)">
               <option value="">None</option>
               {% for m in mappings %}<option value="{{ m.value }}"{% if m.selected %} selected{% endif %}>{{ m.label }}</option>{% endfor %}
             </select>
           </label>
           <label class="cf-label">Version
-            <input type="number" name="mapping_version" class="cf-input" min="1" value="{{ config.mapping_version or '' }}">
+            <input type="number" name="mapping_version" class="cf-input" min="1" value="{{ config.mapping_version or '' }}" title="Specific mapping version to use (blank = latest)">
           </label>
         </div>
         <div>
           <label class="cf-label">Enrichment
-            <select name="enrichment_id" class="cf-input">
+            <select name="enrichment_id" class="cf-input" title="Look up additional data from a database during processing">
               <option value="">None</option>
               {% for e in enrichments %}<option value="{{ e.value }}"{% if e.selected %} selected{% endif %}>{{ e.label }}</option>{% endfor %}
             </select>
           </label>
           <label class="cf-label">Version
-            <input type="number" name="enrichment_version" class="cf-input" min="1" value="{{ config.enrichment_version or '' }}">
+            <input type="number" name="enrichment_version" class="cf-input" min="1" value="{{ config.enrichment_version or '' }}" title="Specific enrichment version to use (blank = latest)">
           </label>
         </div>
       </div>
@@ -157,13 +207,13 @@
     <fieldset class="cf-section">
       <legend>Policies</legend>
       <label class="cf-label">Retry Policy <span class="cf-req">*</span>
-        <select name="retry_policy_id" class="cf-input">
+        <select name="retry_policy_id" class="cf-input" title="How many times to retry and how long to wait between attempts on failure">
           {% for r in retry_policies %}<option value="{{ r.value }}"{% if r.selected %} selected{% endif %}>{{ r.label }}</option>{% endfor %}
         </select>
       </label>
       <label class="cf-label">Business Rules <small style="font-weight:400;">(JSON, optional)</small>
         <textarea name="semantics" class="cf-input cf-ta" rows="4"
-                  placeholder='[{"field":"priority","rule":"required"}]'>{{ config.semantics or '' }}</textarea>
+                  placeholder='[{"field":"priority","rule":"required"}]' title="Custom validation or routing rules in JSON format. Example: require a 'priority' field, route by 'region'.">{{ config.semantics or '' }}</textarea>
       </label>
     </fieldset>
   </div>
@@ -181,7 +231,7 @@
 
     <fieldset class="cf-section">
       <legend>Connection</legend>
-      <p class="cf-hint">Fields shown depend on the destination selected above.</p>
+      <p class="cf-hint">Fields shown depend on the destination selected above. Only the visible group is saved.</p>
       <div id="destination-fields">
         {% for dgroup in dest_groups %}
         <div class="dc-group cf-card" data-destination="{{ dgroup.destination }}"
@@ -196,9 +246,8 @@
     </fieldset>
   </div>
 
-  <input type="hidden" name="is_edit" value="true">
-  <input type="hidden" name="inbound_transport_config" id="inbound_transport_config" value="">
-  <input type="hidden" name="destination_config" id="destination_config" value="">
+  <input type="hidden" name="is_edit" value="{{ 'true' if config.channel_id else 'false' }}">
+  <input type="hidden" name="wizard_step" id="wizard_step" value="{{ initial_step or 0 }}">
 
   <div class="cf-actions">
     <button type="button" class="btn" id="cf-prev" onclick="step(-1)" style="display:none;">&#8592; Back</button>
@@ -210,57 +259,19 @@
 
 </form>
 
-<style>
-.channel-form{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px;color:#0f172a}
-.cf-header{display:flex;align-items:center;gap:8px;padding:0 0 14px;font-size:15px;font-weight:700;color:#1e293b}
-.cf-header-icon{font-size:18px}
-.cf-header-id{font-size:11px;color:#64748b;background:#f1f5f9;padding:2px 8px;border-radius:3px;font-weight:400}
-
-.cf-tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:2px solid #e2e8f0}
-.cf-tab{flex:1;padding:10px 12px;border:none;background:none;font-size:12px;font-weight:600;color:#94a3b8;cursor:pointer;text-align:center;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s;font-family:inherit}
-.cf-tab:hover{color:#64748b}
-.cf-tab.active{color:#0284c7;border-bottom-color:#0284c7}
-.cf-tab.done{color:#16a34a}
-
-.cf-step{display:none}
-.cf-step.active{display:block}
-
-.cf-section{border:1px solid #e2e8f0;border-radius:8px;padding:0;margin:0 0 14px;background:#fff}
-.cf-section legend{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#64748b;padding:0 8px;margin-left:8px}
-.cf-section>*:not(legend){padding:0 14px}
-.cf-section>*:last-child{padding-bottom:14px}
-.cf-hint{font-size:11px;color:#94a3b8;margin:-6px 0 10px;padding-top:0!important}
-
-.cf-row{display:grid;gap:10px;padding:10px 14px!important}
-.cf-row.cols-2{grid-template-columns:1fr 1fr}
-.cf-row.cols-3{grid-template-columns:1fr 1fr 1fr}
-
-.cf-label{display:block;margin-bottom:2px;font-size:11px;font-weight:600;color:#475569}
-.cf-req{color:#dc2626}
-.cf-input,.cf-ta{width:100%;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px;font-family:inherit;background:#fff;color:#0f172a;transition:border-color .15s;box-sizing:border-box;margin-top:3px}
-.cf-input:focus,.cf-ta:focus{outline:none;border-color:#0284c7;box-shadow:0 0 0 3px rgba(2,132,199,.12)}
-.cf-input[readonly]{background:#f8fafc;color:#94a3b8;cursor:default}
-.cf-ta{resize:vertical;font-family:"Courier New",monospace;font-size:11px;min-height:60px}
-.cf-input[type=checkbox]{width:auto;margin-right:6px;accent-color:#0284c7}
-.cf-checkbox{display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;cursor:pointer;padding:2px 0}
-
-.cf-card{border:1px solid #e2e8f0;border-radius:6px;overflow:hidden;background:#f8fafc;margin-bottom:8px}
-.cf-card-title{font-size:11px;font-weight:600;color:#0284c7;background:#f0f9ff;padding:7px 12px;border-bottom:1px solid #e0f2fe}
-.cf-card-body{padding:8px 12px!important}
-
-.cf-actions{display:flex;gap:8px;padding:4px 0 0;align-items:center}
-
-@media(max-width:640px){.cf-row.cols-2,.cf-row.cols-3{grid-template-columns:1fr}}
-</style>
-
 <script>
 (function(){
 var f=document.getElementById('channel-form'); if(!f)return;
 var steps=f.querySelectorAll('.cf-step'), tabs=f.querySelectorAll('.cf-tab');
 var prev=f.querySelector('#cf-prev'), next=f.querySelector('#cf-next'), save=f.querySelector('#cf-save');
+var wizardStepInput=f.querySelector('#wizard_step');
 var total=steps.length, current=0;
 
 window.step=function(d){
+  if(d>0){
+    var bad=steps[current].querySelector(':invalid');
+    if(bad){ bad.reportValidity(); return; }
+  }
   var nextIdx=current+d;
   if(nextIdx<0||nextIdx>=total)return;
   steps[current].classList.remove('active');
@@ -271,17 +282,76 @@ window.step=function(d){
   prev.style.display=current===0?'none':'';
   next.style.display=current===total-1?'none':'';
   save.style.display=current===total-1?'':'none';
+  wizardStepInput.value=current;
+  updateFlow(current);
 };
 
+function updateFlow(idx) {
+  var flow=document.getElementById('cf-flow'); if(!flow)return;
+  var stages=flow.querySelectorAll('.cf-flow-stage');
+  var arrows=flow.querySelectorAll('.cf-flow-arrow');
+  stages.forEach(function(s){s.classList.remove('active','done')});
+  arrows.forEach(function(a){a.classList.remove('active','done')});
+  var flowMap = {1:'source', 2:'pipeline', 3:'destination'};
+  var arrowMap = {2:'arrow1', 3:'arrow2'};
+  for (var i = 1; i <= 3; i++) {
+    var stage = flow.querySelector('[data-flow="'+flowMap[i]+'"]');
+    var arrow = flow.querySelector('[data-flow="'+arrowMap[i]+'"]');
+    if (idx > i) { if(stage) stage.classList.add('done'); if(arrow) arrow.classList.add('done'); }
+    else if (idx === i) { if(stage) stage.classList.add('active'); if(arrow) arrow.classList.add('active'); }
+  }
+}
+
+tabs.forEach(function(tab, idx){
+  tab.addEventListener('click', function(){
+    if(idx===current) return;
+    if(idx>current){
+      var bad=steps[current].querySelector(':invalid');
+      if(bad){ bad.reportValidity(); return; }
+    }
+    step(idx-current);
+  });
+});
+
+f.addEventListener('invalid', function(e){
+  var stepEl = e.target.closest('.cf-step');
+  if(!stepEl) return;
+  var idx = parseInt(stepEl.getAttribute('data-step'), 10);
+  if(idx !== current){ step(idx - current); }
+}, true);
+
+var initStep = parseInt(wizardStepInput.value || '0', 10);
+if (initStep > 0 && initStep < total) { step(initStep); }
+
+// --- Transport / destination toggle ---
 // --- Transport / destination toggle ---
 var ts=f.querySelector('#transport-select'), ds=f.querySelector('#destination-select');
-var htc=f.querySelector('#inbound_transport_config'), hdc=f.querySelector('#destination_config');
-function tg(s,g,a){g.forEach(function(x){x.style.display=x.getAttribute('data-'+a)===s.value?'block':'none'})}
-function sf(p){var o={};f.querySelectorAll('[name^="'+p+'__"]').forEach(function(e){var g=e.closest('[data-transport],[data-destination]');if(g&&g.style.display==='none')return;var k=e.name.split('__')[1];if(e.type==='checkbox'){if(e.checked)o[k]=true}else if(e.value!==''&&e.value!==undefined){var n=Number(e.value);o[k]=isNaN(n)?e.value:n}});return Object.keys(o).length?JSON.stringify(o):''}
-if(ts){var tgA=Array.from(f.querySelectorAll('.tc-group'));ts.addEventListener('change',function(){tg(ts,tgA,'transport')})}
-if(ds){var dgA=Array.from(f.querySelectorAll('.dc-group'));ds.addEventListener('change',function(){tg(ds,dgA,'destination')})}
-f.addEventListener('htmx:configRequest',function(){htc.value=sf('tc');hdc.value=sf('dc')});
+
+function tg(s,g,a){
+  g.forEach(function(x){
+    var show = x.getAttribute('data-'+a)===s.value;
+    x.style.display = show ? 'block' : 'none';
+    // Disabled fields are excluded from constraint validation AND from
+    // form submission — this is what actually stops the hidden group's
+    // required fields from blocking Next/Save.
+    x.querySelectorAll('input,select,textarea').forEach(function(el){
+      el.disabled = !show;
+    });
+  });
+}
+
+if(ts){
+  var tgA=Array.from(f.querySelectorAll('.tc-group'));
+  tg(ts, tgA, 'transport');           // apply on initial load, not just on change
+  ts.addEventListener('change', function(){ tg(ts, tgA, 'transport'); });
+}
+if(ds){
+  var dgA=Array.from(f.querySelectorAll('.dc-group'));
+  tg(ds, dgA, 'destination');         // same for destination groups
+  ds.addEventListener('change', function(){ tg(ds, dgA, 'destination'); });
+}
+// --- Flash auto-dismiss ---
+var flash=document.getElementById('cf-flash');
+if(flash){setTimeout(function(){flash.style.transition='opacity 0.4s';flash.style.opacity='0';setTimeout(function(){flash.remove()},400)},8000);}
 })();
 </script>
-</body>
-</html>

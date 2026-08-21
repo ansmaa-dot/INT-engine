@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Integration Engine{% endblock %}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <link rel="stylesheet" href="/static/engine.css">
+    {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="page-wrap">
+    {% block header %}
+    <header>
+        <h1><span>&#9881;</span> Integration Engine Dashboard</h1>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="status-tag" hx-get="/health" hx-trigger="load, every 5s">
+                Engine: <strong>--</strong> &nbsp;|&nbsp; Channels: <strong>--</strong>
+            </div>
+        </div>
+    </header>
+    {% endblock %}
+
+    {% block content %}{% endblock %}
+  </div>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

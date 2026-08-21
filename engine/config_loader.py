@@ -32,6 +32,10 @@ from nodes.destination.http_client import HttpClientNode
 from nodes.destination.mllp_client import MllpClientNode
 from nodes.destination.sftp_client import SFTPClientNode
 from nodes.enrichment.batch_lookup import BatchLookup
+from nodes.enrichment.db_adapter import (
+    build_adapter,
+    is_valid_identifier,
+)
 from nodes.ingestion.db_poller import DBPoller
 from nodes.ingestion.file_watcher import FileWatcher
 from nodes.ingestion.http_poller import HTTPPoller
@@ -58,6 +62,15 @@ def _json_text(obj) -> str | None:
     if isinstance(obj, (dict, list)):
         return json.dumps(obj, default=str)
     return str(obj)
+
+
+def _ensure_column(conn, table: str, col: str, col_def: str) -> None:
+    """Add *col* to *table* if it doesn't already exist (safe no-op migration)."""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    existing = {r["name"] for r in cur.fetchall()}
+    if col not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+        conn.commit()
 
 
 _auth_manager: AuthManager | None = None
@@ -140,6 +153,8 @@ class ChannelConfigRegistry:
                     target_key_col TEXT NOT NULL,
                     fields TEXT NOT NULL,
                     lookup_name TEXT NOT NULL,
+                    db_type TEXT DEFAULT 'sqlite',
+                    connection_string TEXT,
                     description TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -147,6 +162,9 @@ class ChannelConfigRegistry:
                 )
                 """
             )
+            # Schema migration: add columns if missing on existing DBs.
+            _ensure_column(conn, "enrichments", "db_type", "TEXT DEFAULT 'sqlite'")
+            _ensure_column(conn, "enrichments", "connection_string", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS retry_policies (
@@ -243,13 +261,37 @@ class ChannelConfigRegistry:
     def save_enrichment(self, enrichment_id: str, source_key_field: str,
                         lookup_db_path: str, target_table: str, target_key_col: str,
                         fields: list, lookup_name: str, description: str = "",
-                        version: int | None = None) -> int:
+                        version: int | None = None,
+                        db_type: str = "sqlite",
+                        connection_string: str | None = None) -> int:
         if not enrichment_id:
             raise ConfigValidationError("enrichment_id is required")
         if not all([source_key_field, lookup_db_path, target_table, target_key_col]):
             raise ConfigValidationError("enrichment requires source_key_field, lookup_db_path, target_table, target_key_col")
         if not isinstance(fields, list):
             raise ConfigValidationError("enrichment fields must be a JSON array")
+
+        # Validate SQL identifiers to prevent injection.
+        for label, val in [("target_table", target_table), ("target_key_col", target_key_col)]:
+            if not is_valid_identifier(val):
+                raise ConfigValidationError(
+                    f"enrichment {label}={val!r} is not a valid SQL identifier"
+                )
+        for i, fld in enumerate(fields):
+            if not isinstance(fld, str) or not is_valid_identifier(fld):
+                raise ConfigValidationError(
+                    f"enrichment field[{i}]={fld!r} is not a valid SQL identifier"
+                )
+
+        if db_type not in ("sqlite", "postgresql", "postgres", "mysql"):
+            raise ConfigValidationError(
+                f"unsupported db_type: {db_type!r} (use sqlite, postgresql, or mysql)"
+            )
+        if db_type != "sqlite" and not connection_string:
+            raise ConfigValidationError(
+                f"connection_string is required for db_type={db_type!r}"
+            )
+
         if version is None:
             version = self._next_version("enrichments", "enrichment_id", enrichment_id)
         now = _now_iso()
@@ -257,12 +299,13 @@ class ChannelConfigRegistry:
             conn.execute(
                 """
                 INSERT INTO enrichments (enrichment_id, version, source_key_field, lookup_db_path,
-                    target_table, target_key_col, fields, lookup_name, description, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    target_table, target_key_col, fields, lookup_name, db_type, connection_string,
+                    description, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (enrichment_id, version, source_key_field, lookup_db_path,
                  target_table, target_key_col, json.dumps(fields), lookup_name,
-                 description, now, now),
+                 db_type, connection_string, description, now, now),
             )
             conn.commit()
         return version
@@ -277,7 +320,7 @@ class ChannelConfigRegistry:
     def list_enrichments(self) -> list[dict]:
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT enrichment_id, version, description FROM enrichments ORDER BY enrichment_id, version"
+                "SELECT enrichment_id, version, db_type, description FROM enrichments ORDER BY enrichment_id, version"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -527,13 +570,55 @@ class ChannelConfigRegistry:
         enr = config.get("enrichment")
         if not enr:
             return None
+
+        db_type = (enr.get("db_type") or "sqlite").lower()
+
+        # Build the adapter first so we can validate at build time.
+        if db_type == "sqlite":
+            adapter = build_adapter("sqlite", db_path=enr["lookup_db_path"])
+        else:
+            cs = enr.get("connection_string")
+            if not cs:
+                raise ConfigValidationError(
+                    f"enrichment {enr['enrichment_id']!r}: connection_string required for db_type={db_type!r}"
+                )
+            adapter = build_adapter(db_type, connection_string=cs)
+
+        # Build-time validation: check the DB is accessible and the target
+        # table / columns exist.
+        try:
+            adapter.validate()
+        except Exception as e:
+            raise ConfigValidationError(
+                f"enrichment {enr['enrichment_id']!r}: cannot connect to {db_type} db: {e}"
+            ) from e
+
+        if not adapter.table_exists(enr["target_table"]):
+            raise ConfigValidationError(
+                f"enrichment {enr['enrichment_id']!r}: table {enr['target_table']!r} not found in {db_type} db"
+            )
+
+        cols = adapter.column_names(enr["target_table"])
+        if enr["target_key_col"] not in cols:
+            raise ConfigValidationError(
+                f"enrichment {enr['enrichment_id']!r}: "
+                f"column {enr['target_key_col']!r} not found in table {enr['target_table']!r}"
+            )
+        fields = self._parse_json(enr["fields"], [])
+        for fld in fields:
+            if fld not in cols:
+                raise ConfigValidationError(
+                    f"enrichment {enr['enrichment_id']!r}: "
+                    f"field {fld!r} not found in table {enr['target_table']!r}"
+                )
+
         return BatchLookup(
-            db_path=enr["lookup_db_path"],
             source_key_field=enr["source_key_field"],
             target_table=enr["target_table"],
             target_key_col=enr["target_key_col"],
-            fields=self._parse_json(enr["fields"], []),
+            fields=fields,
             lookup_name=enr["lookup_name"],
+            db_adapter=adapter,
         )
 
     def build_runner(self, channel_id: str, queue, destination=None) -> ChannelRunner:

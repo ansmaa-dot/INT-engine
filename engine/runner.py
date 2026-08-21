@@ -3,12 +3,13 @@ import traceback
 from pydantic import ValidationError as PydanticValidationError
 
 from core.queue import PersistentQueue
-from core.message import MessageState
+from core.message import Envelope, MessageState
 from core.model import CanonicalMessage
 from core.errors import (
     CanonicalValidationError,
     DecodeError,
     DestinationError,
+    EnrichmentError,
     PipelineError,
     SerializeError,
     TransformError,
@@ -19,7 +20,7 @@ from nodes.codec import get as get_codec
 from nodes.codec.registry import CodecNotFoundError
 
 # Stages whose failures are treated as permanent (no retry — DLQ directly).
-PERMANENT_STAGES = {"decode", "validation", "business", "transform", "serialize"}
+PERMANENT_STAGES = {"decode", "validation", "business", "enrichment", "transform", "serialize"}
 
 
 class ChannelRunner:
@@ -132,7 +133,7 @@ class ChannelRunner:
                 "canonical.type", "pipeline expected a CanonicalMessage"
             )
 
-    def _enrich(self, envelope) -> None:
+    def _enrich(self, envelope: "Envelope") -> None:
         if not self.enricher:
             return
         try:
@@ -140,7 +141,7 @@ class ChannelRunner:
         except PipelineError:
             raise
         except Exception as e:
-            raise TransformError(
+            raise EnrichmentError(
                 "enrichment.failed", f"enrichment failed: {e}", cause=e
             ) from e
 

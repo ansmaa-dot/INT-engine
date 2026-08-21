@@ -3,6 +3,7 @@ import json
 from core.message import Envelope
 from core.queue import PersistentQueue
 from engine.runner import ChannelRunner
+from nodes.base import EnrichmentNode
 from nodes.transform.field_mapper import FieldMapper
 
 
@@ -18,7 +19,7 @@ class RecordingDestination:
         self.sent.append(message.content)
 
 
-class StubEnricher:
+class StubEnricher(EnrichmentNode):
     """Attaches a lookup value so a mapper can reference lookups.<name>.<field>."""
 
     def __init__(self, name="ref", data=None):

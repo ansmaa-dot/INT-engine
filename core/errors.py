@@ -63,6 +63,10 @@ class TransformError(PipelineError):
     stage = "transform"
 
 
+class EnrichmentError(PipelineError):
+    stage = "enrichment"
+
+
 class SerializeError(PipelineError):
     stage = "serialize"
 

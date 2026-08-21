@@ -161,27 +161,27 @@ def get_channel_message_detail(channel_id, trace_id):
     else:
         out.append('<div class="error-banner banner-ok"><b>No processing errors.</b></div>')
 
-    source_pane = f'<div class="code-block">{_esc(pretty_payload(row["raw"]))}</div>'
+    source_pane = f'<div class="code-block-dark">{_esc(pretty_payload(row["raw"]))}</div>'
 
     transformed_pretty = pretty_payload(row["canonical"])
     if transformed_pretty is not None:
-        dest_pane = f'<div class="code-block dest-sent">{_esc(transformed_pretty)}</div>'
+        dest_pane = f'<div class="code-block-dark dest-sent">{_esc(transformed_pretty)}</div>'
     else:
-        dest_pane = ('<div class="code-block dim-block">No outbound payload \u2014 '
+        dest_pane = ('<div class="code-block-dark dim-block">No outbound payload \u2014 '
                      'processing failed before reaching the destination.</div>')
 
     out.append(f"""<div class="grid-2col pane-grid">
         <div class="section-box pane">
             <div class="section-header-row pane-header">
                 <span class="pane-title">Source</span>
-                <span class="pane-sub">raw inbound payload \u00b7 <code class="pane-codec">{safe_in_label}</code></span>
+                <span class="pane-sub">raw inbound payload · <code class="pane-codec">{safe_in_label}</code></span>
             </div>
             <div style="padding: 12px;">{source_pane}</div>
         </div>
         <div class="section-box pane">
             <div class="section-header-row pane-header">
                 <span class="pane-title">Destination</span>
-                <span class="pane-sub">transformed outbound payload \u00b7 <code class="pane-codec">{safe_out_label}</code></span>
+                <span class="pane-sub">transformed outbound payload · <code class="pane-codec">{safe_out_label}</code></span>
             </div>
             <div style="padding: 12px;">{dest_pane}</div>
         </div>

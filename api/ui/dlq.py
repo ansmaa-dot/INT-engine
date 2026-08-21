@@ -33,9 +33,9 @@ def get_ui_dlq():
             <td style="color: var(--status-red);">{safe_last_error}</td>
             <td>
                 <div style="display:flex; gap:4px;">
-                    <button class="btn" hx-get="/ui/dlq/{safe_trace_id}" hx-target="#inspector-box">Inspect</button>
-                    <button class="btn btn-primary" hx-post="/ui/dlq/{safe_trace_id}/requeue" hx-target="#dlq-table-body" hx-swap="innerHTML">Requeue</button>
-                    <button class="btn btn-danger" hx-delete="/ui/dlq/{safe_trace_id}" hx-confirm="Discard this DLQ entry permanently?" hx-target="#dlq-table-body" hx-swap="innerHTML">Discard</button>
+                    <button class="btn" hx-get="/ui/dlq/{safe_trace_id}" hx-target="#inspector-box" title="View the full payload and error details">Inspect</button>
+                    <button class="btn btn-primary" hx-post="/ui/dlq/{safe_trace_id}/requeue" hx-target="#dlq-table-body" hx-swap="innerHTML" title="Move this message back into the processing queue">Requeue</button>
+                    <button class="btn btn-danger" hx-delete="/ui/dlq/{safe_trace_id}" hx-confirm="Discard this DLQ entry permanently?" hx-target="#dlq-table-body" hx-swap="innerHTML" title="Permanently delete this message">Discard</button>
                 </div>
             </td>
         </tr>

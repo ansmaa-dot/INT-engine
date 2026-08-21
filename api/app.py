@@ -9,6 +9,8 @@ Run with::
 import sys
 import os
 
+from flask_wtf import CSRFProtect
+
 # Ensure core / engine packages are importable regardless of execution path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,10 +27,19 @@ from api.deps import queue, registry, auth_manager, webhooks, sync_webhooks
 # Application factory
 # ---------------------------------------------------------------------------
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
 def create_app() -> Flask:
     """Build and configure the Flask application."""
-    app = Flask(__name__, template_folder="ui/templates")
-
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(_HERE, "ui", "templates"),
+        static_folder=os.path.join(_HERE, "static"),
+    )
+    #csrf
+    app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
+    CSRFProtect(app)
     # --- shared singletons ---
     _queue = PersistentQueue("queue.db")
     _registry = ChannelConfigRegistry("queue.db")

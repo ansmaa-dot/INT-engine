@@ -1,0 +1,20 @@
+<div class="metric-card">
+    <div class="val">{{ healthy }}<span class="sub">/ {{ active_count }}</span></div>
+    <div class="lbl">Healthy Channels</div>
+    <div class="sub">{{ degraded }} degraded</div>
+</div>
+<div class="metric-card">
+    <div class="val">{{ queued }}</div>
+    <div class="lbl">Queue Depth</div>
+    <div class="sub">in-flight: {{ in_flight }}</div>
+</div>
+<div class="metric-card">
+    <div class="val" style="color: var(--status-red);">{{ dlq }}</div>
+    <div class="lbl">DLQ Count</div>
+    <div class="sub">retries across channels: {{ retries }}</div>
+</div>
+<div class="metric-card">
+    <div class="val">{{ delivered }}</div>
+    <div class="lbl">Delivered Total</div>
+    <div class="sub">{{ "%.1f"|format(dnpm) }} / min (5m)</div>
+</div>

@@ -111,11 +111,10 @@ def parse_to_canonical(raw: str, metadata: WireContext | None = None) -> Canonic
     msh = msg.first("MSH")
     if msh is None:
         raise DecodeError("hl7.no_msh", "HL7 message has no MSH segment")
-
     canonical = CanonicalMessage()
     metadata_model = MessageMetadata(format="hl7v2")
-    metadata_model.version = unescape(msh.get(11)) or "2.5.1"                  # MSH-12
-    metadata_model.message_type = unescape(component(msh.get(8), 0)) or None   # MSH-9.1
+    metadata_model.version = unescape(msh.get(11)) or "2.5.1"            # MSH-12
+    metadata_model.message_type = unescape(msh.get(8)) or None           # MSH-9 msgtype
     metadata_model.message_id = unescape(msh.get(9)) or None                   # MSH-10
     metadata_model.source = unescape(msh.get(2)) or None                       # MSH-3
     if metadata is not None:

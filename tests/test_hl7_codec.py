@@ -19,7 +19,7 @@ def test_parse_oru_golden_metadata_and_patient():
     c = ORU.parse(oru_r01())
     assert c.metadata.format == "hl7v2"
     assert c.metadata.version == "2.5.1"
-    assert c.metadata.message_type == "ORU"
+    assert c.metadata.message_type == "ORU^R01"
     assert c.metadata.message_id == "CTRL001"
 
     p = c.patient
@@ -82,7 +82,7 @@ def test_parse_oru_golden_observations():
 
 def test_parse_adt_a01():
     c = ADT.parse(adt_a01())
-    assert c.metadata.message_type == "ADT"
+    assert c.metadata.message_type == "ADT^A01"
     assert c.patient.identifiers[0].value == "555000111"
     assert c.encounter.visit_number.value == "VISIT123"
 
