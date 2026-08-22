@@ -1,32 +1,51 @@
-"""Channel configuration: declarative channels referencing reusable
-capabilities.
+"""Channel configuration: declarative channels with an ordered step-chain
+pipeline.
 
 A channel is orchestration ONLY:
 
-    Inbound Transport + Inbound Codec + [Enrichment ref] + [Mapping ref]
-  + Outbound Codec + Destination + Retry Policy ref [+ optional semantics]
+    Inbound Transport + Inbound Codec + ordered pipeline steps
+  + Outbound Codec + Destination + Retry Policy ref
 
-Reusable definitions live in dedicated tables with stable identity/versioning:
+The pipeline is an ordered JSON array of typed steps (enrich / transform /
+filter / assert) stored on the channel row. Steps are either *inline*
+(config lives in the array itself) or *shared* (a pinned
+``{"kind", "id", "version"}`` reference into the generic ``shared_steps``
+table). Every save appends resolved per-step snapshots to the immutable
+``pipeline_steps`` history keyed by stable ``step_id`` + version.
 
-  * mappings       — (mapping_id, version) -> JSON rules using canonical paths
-  * enrichments    — (enrichment_id, version) -> lookup definition
-  * retry_policies — retry_policy_id -> max_retries / base_backoff_seconds
-
-Editing a mapping/enrichment creates a NEW version row; channels pin a
-specific version, so a change never silently alters consumers unless they are
-explicitly repointed to the new version.
+The schema is stamped via SQLite ``PRAGMA user_version``; any mismatch
+triggers a hard reset (drop + recreate + reseed). There is deliberately no
+migration path from the legacy mapping/enrichment schema (plan §4 D1).
 
 Configuration validation is explicit and fail-fast. Unknown transports,
-codecs, or destinations, and missing mapping/enrichment/retry references are
+codecs, destinations, step types, and missing shared/retry references are
 rejected at save/validate time — there is never a silent fallback (e.g. no
 implicit passthrough codec).
 """
 import json
+import re
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 
 from core.auth_manager import AuthManager
+from core.expression import validate_expression
+from core.field_catalog import (
+    all_catalog_paths,
+    identifier_object_paths,
+    validate_canonical_path,
+)
 from engine.runner import ChannelRunner
+from engine.steps import (
+    ASSERT_ON_FAIL,
+    FILTER_ON_FAIL,
+    SHARED_KIND_TO_STEP_TYPE,
+    SHARED_KINDS,
+    STEP_TYPE_TO_SHARED_KIND,
+    STEP_TYPES,
+    Step,
+    build_step,
+)
 from nodes.codec import keys as codec_keys
 from nodes.destination.http_client import HttpClientNode
 from nodes.destination.mllp_client import MllpClientNode
@@ -41,11 +60,20 @@ from nodes.ingestion.file_watcher import FileWatcher
 from nodes.ingestion.http_poller import HTTPPoller
 from nodes.ingestion.mllp_server import MLLPServer
 from nodes.transform.field_mapper import FieldMapper
+from nodes.transform.functions import REGISTRY as TRANSFORM_FN_REGISTRY
 
 # Explicit registries of supported transports / destinations. Adding a new
 # one is one entry here plus one builder branch below.
 TRANSPORTS = {"http_webhook", "mllp", "http_poller", "file_watcher", "db_poller"}
 DESTINATIONS = {"http", "mllp", "sftp"}
+
+# Schema stamp (PRAGMA user_version). Bump = hard reset, not a migration.
+SCHEMA_VERSION = 1
+
+_ENRICH_DB_TYPES = ("sqlite", "postgresql", "postgres", "mysql")
+_STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CATALOG_PATHS = all_catalog_paths()
+_IDENTIFIER_OBJECT_PATHS = identifier_object_paths()
 
 
 class ConfigValidationError(ValueError):
@@ -64,13 +92,30 @@ def _json_text(obj) -> str | None:
     return str(obj)
 
 
-def _ensure_column(conn, table: str, col: str, col_def: str) -> None:
-    """Add *col* to *table* if it doesn't already exist (safe no-op migration)."""
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    existing = {r["name"] for r in cur.fetchall()}
-    if col not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
-        conn.commit()
+def _valid_source_path(path: str) -> bool:
+    """Rule sources may be canonical paths or ``lookups.*`` (the runtime
+    enrichment namespace, which cannot be statically known)."""
+    return path.startswith("lookups.") or validate_canonical_path(path)
+
+
+def _valid_target_path(path: str) -> bool:
+    """Rule targets may be canonical paths or freeform ``extensions.*``."""
+    return (
+        path == "extensions"
+        or path.startswith("extensions.")
+        or validate_canonical_path(path)
+    )
+
+
+def _canonical_index_zero(path: str) -> str:
+    """Canonicalize numeric path segments to ``0`` (mirrors
+    ``field_catalog.validate_canonical_path``'s index handling), so
+    ``patient.identifiers.2.value`` can be checked against catalog paths
+    expressed with a ``0`` index."""
+    parts = []
+    for p in path.split("."):
+        parts.append("0" if p.isdigit() or (p.startswith("-") and p[1:].isdigit()) else p)
+    return ".".join(parts)
 
 
 _auth_manager: AuthManager | None = None
@@ -94,7 +139,6 @@ class ChannelConfigRegistry:
         self.configs = {}
         self.auth = get_auth_manager()
         self._ensure_schema()
-        self.seed_defaults()
 
     # --- schema ------------------------------------------------------------
 
@@ -106,65 +150,67 @@ class ChannelConfigRegistry:
 
     def _ensure_schema(self):
         with self._get_conn() as conn:
+            current = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current != SCHEMA_VERSION:
+                # Hard reset (plan §4 D1): no migration path from legacy
+                # mapping/enrichment schemas — drop and reseed instead.
+                self._hard_reset(conn)
+                # PRAGMA cannot be parameterized; SCHEMA_VERSION is a fixed
+                # module constant, not user input.
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS channels (
                     channel_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
-                    enabled INTEGER DEFAULT 1,
-                    status TEXT DEFAULT 'running',
-                    concurrency INTEGER DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    concurrency INTEGER NOT NULL DEFAULT 1,
                     inbound_transport TEXT NOT NULL,
                     inbound_transport_config TEXT,
                     inbound_codec TEXT NOT NULL,
                     outbound_codec TEXT NOT NULL,
                     destination TEXT NOT NULL,
                     destination_config TEXT,
-                    mapping_id TEXT,
-                    mapping_version INTEGER,
-                    enrichment_id TEXT,
-                    enrichment_version INTEGER,
                     retry_policy_id TEXT,
-                    semantics TEXT
+                    pipeline TEXT NOT NULL DEFAULT '[]'
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS mappings (
-                    mapping_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS shared_steps (
+                    kind TEXT NOT NULL,
+                    id TEXT NOT NULL,
                     version INTEGER NOT NULL,
-                    rules TEXT NOT NULL,
+                    config TEXT NOT NULL,
                     description TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (mapping_id, version)
+                    PRIMARY KEY (kind, id, version)
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS enrichments (
-                    enrichment_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS pipeline_steps (
+                    step_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
                     version INTEGER NOT NULL,
-                    source_key_field TEXT NOT NULL,
-                    lookup_db_path TEXT NOT NULL,
-                    target_table TEXT NOT NULL,
-                    target_key_col TEXT NOT NULL,
-                    fields TEXT NOT NULL,
-                    lookup_name TEXT NOT NULL,
-                    db_type TEXT DEFAULT 'sqlite',
-                    connection_string TEXT,
+                    type TEXT NOT NULL,
+                    config TEXT NOT NULL,
+                    provenance TEXT,
                     description TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (enrichment_id, version)
+                    PRIMARY KEY (step_id, version)
                 )
                 """
             )
-            # Schema migration: add columns if missing on existing DBs.
-            _ensure_column(conn, "enrichments", "db_type", "TEXT DEFAULT 'sqlite'")
-            _ensure_column(conn, "enrichments", "connection_string", "TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pipeline_steps_channel "
+                "ON pipeline_steps (channel_id)"
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS retry_policies (
@@ -176,47 +222,148 @@ class ChannelConfigRegistry:
                 """
             )
             conn.commit()
+        self.seed_defaults()
+
+    @staticmethod
+    def _hard_reset(conn) -> None:
+        # Table names come from this fixed tuple — never user input.
+        for table in ("channels", "pipeline_steps", "shared_steps",
+                      "mappings", "enrichments"):
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.commit()
 
     def seed_defaults(self):
-        """Seeds a demo channel and the reusable definitions it references.
-        Only runs when the config tables are empty."""
+        """Seeds the default retry policy, an identity shared mapping, and a
+        demo channel. Only runs when the tables are empty."""
+        now = _now_iso()
         with self._get_conn() as conn:
             if conn.execute("SELECT COUNT(*) FROM retry_policies").fetchone()[0] == 0:
                 conn.execute(
                     "INSERT INTO retry_policies (retry_policy_id, max_retries, base_backoff_seconds, description) VALUES (?, ?, ?, ?)",
                     ("default", 3, 2, "default: 3 retries, 2s base backoff"),
                 )
-            if conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0] == 0:
+            if conn.execute("SELECT COUNT(*) FROM shared_steps").fetchone()[0] == 0:
                 conn.execute(
-                    "INSERT INTO mappings (mapping_id, version, rules, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    ("identity", 1, "[]", "identity mapping (no changes)", _now_iso(), _now_iso()),
+                    "INSERT INTO shared_steps (kind, id, version, config, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("mapping", "identity", 1, json.dumps({"rules": []}),
+                     "identity mapping (no changes)", now, now),
                 )
             if conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 0:
                 conn.execute(
                     """
                     INSERT INTO channels (channel_id, name, enabled, status, concurrency,
                         inbound_transport, inbound_transport_config, inbound_codec, outbound_codec,
-                        destination, destination_config, mapping_id, mapping_version, retry_policy_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        destination, destination_config, retry_policy_id, pipeline)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        "his_to_lis", "HIS to LIS Pipeline", 1, "running", 1,
-                        "http_webhook", json.dumps({"sig_header": "X-Signature"}),
-                        "json", "json",
-                        "http", json.dumps({"endpoint_url": "http://localhost:5005/api/lis/orders", "method": "POST"}),
-                        "identity", 1, "default",
-                    ),
+                    ("his_to_lis", "HIS to LIS demo", 0, "paused", 1,
+                     "http_webhook", json.dumps({}), "json", "json", "http",
+                     json.dumps({"endpoint_url": "http://localhost:9000/lis"}),
+                     "default", "[]"),
                 )
             conn.commit()
-    # --- reusable definitions CRUD -----------------------------------------
 
-    def _next_version(self, table: str, id_col: str, ident: str) -> int:
-        with self._get_conn() as conn:
-            row = conn.execute(
-                f"SELECT COALESCE(MAX(version), 0) AS v FROM {table} WHERE {id_col} = ?",
-                (ident,),
+    # --- versioning / shared steps -----------------------------------------
+
+    def _next_shared_version(self, conn, kind: str, ident: str) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM shared_steps WHERE kind = ? AND id = ?",
+            (kind, ident),
+        ).fetchone()
+        return int(row[0])
+
+    def _next_step_version(self, conn, step_id: str) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM pipeline_steps WHERE step_id = ?",
+            (step_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def _shared_step_exists(self, kind, ident, version, conn=None) -> bool:
+        def _q(c):
+            return c.execute(
+                "SELECT 1 FROM shared_steps WHERE kind = ? AND id = ? AND version = ?",
+                (kind, ident, version),
             ).fetchone()
-            return int(row["v"]) + 1
+
+        if conn is None:
+            with self._get_conn() as c:
+                return _q(c) is not None
+        return _q(conn) is not None
+
+    def _get_shared_step_config(self, kind, ident, version, conn=None):
+        def _q(c):
+            return c.execute(
+                "SELECT config FROM shared_steps WHERE kind = ? AND id = ? AND version = ?",
+                (kind, ident, version),
+            ).fetchone()
+
+        if conn is None:
+            with self._get_conn() as c:
+                row = _q(c)
+        else:
+            row = _q(conn)
+        if not row:
+            return None
+        return self._parse_json(row["config"], {})
+
+    def save_shared_step(self, kind: str, definition_id: str, config: dict,
+                         description: str = "", version: int | None = None) -> int:
+        """Persists a shared step definition (kind: mapping / enrichment /
+        filter / assert). Each save creates a NEW immutable version row;
+        channels pin a specific version, so edits never silently alter
+        existing consumers."""
+        if kind not in SHARED_KINDS:
+            raise ConfigValidationError(
+                f"unknown shared step kind {kind!r} "
+                f"(must be one of {', '.join(SHARED_KINDS)})")
+        if not definition_id:
+            raise ConfigValidationError("shared step id is required")
+
+        stype = SHARED_KIND_TO_STEP_TYPE[kind]
+        cfg = self._normalize_step_config(stype, dict(config or {}))
+        errors = self._validate_step_config(
+            stype, cfg, f"shared {kind} {definition_id!r}")
+        if errors:
+            raise ConfigValidationError("; ".join(errors))
+
+        now = _now_iso()
+        try:
+            with self._get_conn() as conn:
+                if version is None:
+                    version = self._next_shared_version(conn, kind, definition_id)
+                elif self._shared_step_exists(kind, definition_id, version, conn):
+                    raise ConfigValidationError(
+                        f"shared {kind} {definition_id!r} v{version} already exists — "
+                        "shared definitions are immutable; save a new version instead")
+                conn.execute(
+                    "INSERT INTO shared_steps (kind, id, version, config, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (kind, definition_id, version,
+                     json.dumps(cfg, default=str), description, now, now),
+                )
+                conn.commit()
+        except sqlite3.IntegrityError as e:
+            raise ConfigValidationError(
+                f"shared {kind} {definition_id!r} was edited elsewhere — "
+                "reload and retry") from e
+        return version
+
+    def list_shared_steps(self, kind: str | None = None) -> list[dict]:
+        with self._get_conn() as conn:
+            if kind:
+                rows = conn.execute(
+                    "SELECT kind, id, version, description FROM shared_steps "
+                    "WHERE kind = ? ORDER BY id, version",
+                    (kind,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT kind, id, version, description FROM shared_steps "
+                    "ORDER BY kind, id, version"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- retry policies ----------------------------------------------------
 
     def save_retry_policy(self, retry_policy_id: str, max_retries: int,
                           base_backoff_seconds: int, description: str = ""):
@@ -238,165 +385,12 @@ class ChannelConfigRegistry:
             )
             conn.commit()
 
-    def save_mapping(self, mapping_id: str, rules: list, description: str = "",
-                     version: int | None = None) -> int:
-        """Persists a new mapping version. Each save creates a new version row;
-        channels pin a specific version, so edits never silently alter
-        existing consumers."""
-        if not mapping_id:
-            raise ConfigValidationError("mapping_id is required")
-        if not isinstance(rules, list):
-            raise ConfigValidationError("mapping rules must be a JSON array")
-        if version is None:
-            version = self._next_version("mappings", "mapping_id", mapping_id)
-        now = _now_iso()
-        with self._get_conn() as conn:
-            conn.execute(
-                "INSERT INTO mappings (mapping_id, version, rules, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (mapping_id, version, json.dumps(rules), description, now, now),
-            )
-            conn.commit()
-        return version
-
-    def save_enrichment(self, enrichment_id: str, source_key_field: str,
-                        lookup_db_path: str, target_table: str, target_key_col: str,
-                        fields: list, lookup_name: str, description: str = "",
-                        version: int | None = None,
-                        db_type: str = "sqlite",
-                        connection_string: str | None = None) -> int:
-        if not enrichment_id:
-            raise ConfigValidationError("enrichment_id is required")
-        if not all([source_key_field, lookup_db_path, target_table, target_key_col]):
-            raise ConfigValidationError("enrichment requires source_key_field, lookup_db_path, target_table, target_key_col")
-        if not isinstance(fields, list):
-            raise ConfigValidationError("enrichment fields must be a JSON array")
-
-        # Validate SQL identifiers to prevent injection.
-        for label, val in [("target_table", target_table), ("target_key_col", target_key_col)]:
-            if not is_valid_identifier(val):
-                raise ConfigValidationError(
-                    f"enrichment {label}={val!r} is not a valid SQL identifier"
-                )
-        for i, fld in enumerate(fields):
-            if not isinstance(fld, str) or not is_valid_identifier(fld):
-                raise ConfigValidationError(
-                    f"enrichment field[{i}]={fld!r} is not a valid SQL identifier"
-                )
-
-        if db_type not in ("sqlite", "postgresql", "postgres", "mysql"):
-            raise ConfigValidationError(
-                f"unsupported db_type: {db_type!r} (use sqlite, postgresql, or mysql)"
-            )
-        if db_type != "sqlite" and not connection_string:
-            raise ConfigValidationError(
-                f"connection_string is required for db_type={db_type!r}"
-            )
-
-        if version is None:
-            version = self._next_version("enrichments", "enrichment_id", enrichment_id)
-        now = _now_iso()
-        with self._get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO enrichments (enrichment_id, version, source_key_field, lookup_db_path,
-                    target_table, target_key_col, fields, lookup_name, db_type, connection_string,
-                    description, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (enrichment_id, version, source_key_field, lookup_db_path,
-                 target_table, target_key_col, json.dumps(fields), lookup_name,
-                 db_type, connection_string, description, now, now),
-            )
-            conn.commit()
-        return version
-
-    def list_mappings(self) -> list[dict]:
-        with self._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT mapping_id, version, description FROM mappings ORDER BY mapping_id, version"
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def list_enrichments(self) -> list[dict]:
-        with self._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT enrichment_id, version, db_type, description FROM enrichments ORDER BY enrichment_id, version"
-            ).fetchall()
-        return [dict(r) for r in rows]
-
     def list_retry_policies(self) -> list[dict]:
         with self._get_conn() as conn:
             rows = conn.execute(
                 "SELECT retry_policy_id, max_retries, base_backoff_seconds, description FROM retry_policies ORDER BY retry_policy_id"
             ).fetchall()
         return [dict(r) for r in rows]
-
-    # --- channel CRUD ------------------------------------------------------
-
-    def save_channel_definition(self, definition: dict) -> None:
-        """Validates and persists a channel definition. Invalid definitions
-        raise ConfigValidationError and are never saved."""
-        errors = self.validate_channel_definition(definition)
-        if errors:
-            raise ConfigValidationError("; ".join(errors))
-
-        cid = definition["channel_id"]
-        with self._get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO channels (channel_id, name, enabled, status, concurrency,
-                    inbound_transport, inbound_transport_config, inbound_codec, outbound_codec,
-                    destination, destination_config, mapping_id, mapping_version,
-                    enrichment_id, enrichment_version, retry_policy_id, semantics)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET
-                    name = excluded.name, enabled = excluded.enabled, status = excluded.status,
-                    concurrency = excluded.concurrency,
-                    inbound_transport = excluded.inbound_transport,
-                    inbound_transport_config = excluded.inbound_transport_config,
-                    inbound_codec = excluded.inbound_codec, outbound_codec = excluded.outbound_codec,
-                    destination = excluded.destination, destination_config = excluded.destination_config,
-                    mapping_id = excluded.mapping_id, mapping_version = excluded.mapping_version,
-                    enrichment_id = excluded.enrichment_id, enrichment_version = excluded.enrichment_version,
-                    retry_policy_id = excluded.retry_policy_id, semantics = excluded.semantics
-                """,
-                (
-                    cid, definition["name"], 1 if definition.get("enabled", True) else 0,
-                    definition.get("status", "running"), int(definition.get("concurrency", 1)),
-                    definition["inbound_transport"],
-                    _json_text(definition.get("inbound_transport_config")),
-                    definition["inbound_codec"], definition["outbound_codec"],
-                    definition["destination"], _json_text(definition.get("destination_config")),
-                    definition.get("mapping_id"), definition.get("mapping_version"),
-                    definition.get("enrichment_id"), definition.get("enrichment_version"),
-                    definition.get("retry_policy_id"), _json_text(definition.get("semantics")),
-                ),
-            )
-            conn.commit()
-        self.load_all_configs()
-
-    def delete_channel(self, channel_id: str) -> None:
-        with self._get_conn() as conn:
-            conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
-            conn.commit()
-        self.load_all_configs()
-
-    # --- validation --------------------------------------------------------
-
-    def _mapping_exists(self, mapping_id: str, version: int) -> bool:
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM mappings WHERE mapping_id = ? AND version = ?", (mapping_id, version)
-            ).fetchone()
-        return row is not None
-
-    def _enrichment_exists(self, enrichment_id: str, version: int) -> bool:
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM enrichments WHERE enrichment_id = ? AND version = ?",
-                (enrichment_id, version),
-            ).fetchone()
-        return row is not None
 
     def _retry_exists(self, retry_policy_id: str) -> bool:
         with self._get_conn() as conn:
@@ -405,10 +399,112 @@ class ChannelConfigRegistry:
             ).fetchone()
         return row is not None
 
+    # --- channel CRUD ------------------------------------------------------
+
+    def save_channel_definition(self, definition: dict) -> None:
+        """Validates and persists a channel definition. Invalid definitions
+        raise ConfigValidationError and are never saved.
+
+        Steps without a ``step_id`` get one assigned here (stable identity
+        across reorders/edits, plan §5 D2); every save appends resolved
+        snapshots to the immutable ``pipeline_steps`` history (§5.3).
+        """
+        definition = dict(definition)
+        pipeline = definition.get("pipeline")
+        entries: list = []
+        if pipeline is not None:
+            if not isinstance(pipeline, list):
+                raise ConfigValidationError("pipeline must be a JSON array of steps")
+            for entry in pipeline:
+                e = dict(entry) if isinstance(entry, dict) else entry
+                if isinstance(e, dict) and not e.get("step_id"):
+                    e["step_id"] = str(uuid.uuid4())
+                entries.append(e)
+            definition["pipeline"] = entries
+
+        errors = self.validate_channel_definition(definition)
+        if errors:
+            raise ConfigValidationError("; ".join(errors))
+
+        cid = definition["channel_id"]
+        now = _now_iso()
+        try:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO channels (channel_id, name, enabled, status, concurrency,
+                        inbound_transport, inbound_transport_config, inbound_codec, outbound_codec,
+                        destination, destination_config, retry_policy_id, pipeline)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(channel_id) DO UPDATE SET
+                        name = excluded.name, enabled = excluded.enabled, status = excluded.status,
+                        concurrency = excluded.concurrency,
+                        inbound_transport = excluded.inbound_transport,
+                        inbound_transport_config = excluded.inbound_transport_config,
+                        inbound_codec = excluded.inbound_codec, outbound_codec = excluded.outbound_codec,
+                        destination = excluded.destination, destination_config = excluded.destination_config,
+                        retry_policy_id = excluded.retry_policy_id, pipeline = excluded.pipeline
+                    """,
+                    (
+                        cid, definition["name"], 1 if definition.get("enabled", True) else 0,
+                        definition.get("status", "running"), int(definition.get("concurrency", 1)),
+                        definition["inbound_transport"],
+                        _json_text(definition.get("inbound_transport_config")),
+                        definition["inbound_codec"], definition["outbound_codec"],
+                        definition["destination"], _json_text(definition.get("destination_config")),
+                        definition.get("retry_policy_id"),
+                        json.dumps(entries, default=str),
+                    ),
+                )
+                for entry in entries:
+                    snapshot_cfg, provenance = self._resolve_step_snapshot(entry, conn)
+                    version = self._next_step_version(conn, entry["step_id"])
+                    conn.execute(
+                        "INSERT INTO pipeline_steps (step_id, channel_id, version, type, config, provenance, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (entry["step_id"], cid, version, entry["type"],
+                         json.dumps(snapshot_cfg, default=str),
+                         _json_text(provenance), entry.get("description"), now, now),
+                    )
+                conn.commit()
+        except sqlite3.IntegrityError as e:
+            raise ConfigValidationError(
+                f"channel {cid!r} was edited elsewhere — reload and retry") from e
+        self.load_all_configs()
+
+    def _resolve_step_snapshot(self, entry: dict, conn):
+        """Resolve a pipeline entry to (config snapshot, provenance).
+
+        Shared references resolve to the pinned shared config, recorded in
+        provenance; inline steps carry no provenance (the channel row is
+        the source of truth).
+        """
+        shared = entry.get("shared")
+        if isinstance(shared, dict):
+            cfg = self._get_shared_step_config(
+                shared.get("kind"), shared.get("id"), shared.get("version"), conn) or {}
+            provenance = {
+                "kind": shared.get("kind"),
+                "id": shared.get("id"),
+                "version": shared.get("version"),
+            }
+        else:
+            cfg = entry.get("config") or {}
+            provenance = None
+        return self._normalize_step_config(entry["type"], cfg), provenance
+
+    def delete_channel(self, channel_id: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+            conn.execute("DELETE FROM pipeline_steps WHERE channel_id = ?", (channel_id,))
+            conn.commit()
+        self.load_all_configs()
+
+    # --- validation --------------------------------------------------------
+
     def validate_channel_definition(self, definition: dict) -> list[str]:
         """Returns a list of validation errors (empty = valid). Unknown
-        transports/codecs/destinations and missing reusable-definition
-        references are rejected here, before runtime."""
+        transports/codecs/destinations, malformed pipeline steps, and
+        missing shared/retry references are rejected here, before runtime."""
         errors = []
         if not definition.get("channel_id"):
             errors.append("channel_id is required")
@@ -430,27 +526,21 @@ class ChannelConfigRegistry:
         if dest not in DESTINATIONS:
             errors.append(f"unknown destination: {dest!r}")
 
-        mapping_id = definition.get("mapping_id")
-        if mapping_id:
-            v = definition.get("mapping_version")
-            if not v:
-                errors.append("mapping_version is required when mapping_id is set")
-            elif not self._mapping_exists(mapping_id, int(v)):
-                errors.append(f"mapping {mapping_id!r} version {v} does not exist")
-
-        enrichment_id = definition.get("enrichment_id")
-        if enrichment_id:
-            v = definition.get("enrichment_version")
-            if not v:
-                errors.append("enrichment_version is required when enrichment_id is set")
-            elif not self._enrichment_exists(enrichment_id, int(v)):
-                errors.append(f"enrichment {enrichment_id!r} version {v} does not exist")
-
         rp = definition.get("retry_policy_id")
         if not rp:
             errors.append("retry_policy_id is required")
         elif not self._retry_exists(rp):
             errors.append(f"retry policy {rp!r} does not exist")
+
+        pipeline = definition.get("pipeline")
+        if pipeline is None:
+            pipeline = []
+        if not isinstance(pipeline, list):
+            errors.append("pipeline must be a JSON array of steps")
+        else:
+            seen_ids: set[str] = set()
+            for i, entry in enumerate(pipeline):
+                errors.extend(self._validate_pipeline_entry(i, entry, seen_ids))
 
         tc = definition.get("inbound_transport_config") or {}
         if transport == "mllp" and not tc.get("port"):
@@ -472,9 +562,180 @@ class ChannelConfigRegistry:
 
         return errors
 
-# --- load / build ------------------------------------------------------
+    def _validate_pipeline_entry(self, index: int, entry, seen_ids: set) -> list[str]:
+        label = f"pipeline[{index}]"
+        if not isinstance(entry, dict):
+            return [f"{label}: step must be a JSON object"]
 
-    def _parse_json(self, value, default=None):
+        errors: list[str] = []
+        sid = entry.get("step_id")
+        if sid is not None:
+            if not isinstance(sid, str) or not _STEP_ID_RE.match(sid):
+                errors.append(
+                    f"{label}: step_id {sid!r} must match [A-Za-z0-9_-]{{1,64}}")
+            elif sid in seen_ids:
+                errors.append(f"{label}: duplicate step_id {sid!r}")
+            else:
+                seen_ids.add(sid)
+
+        stype = entry.get("type")
+        if stype not in STEP_TYPES:
+            errors.append(
+                f"{label}: unknown step type {stype!r} "
+                f"(must be one of {', '.join(STEP_TYPES)})")
+            return errors
+
+        if entry.get("description") is not None and not isinstance(entry.get("description"), str):
+            errors.append(f"{label}: description must be a string")
+
+        has_config = entry.get("config") is not None
+        shared = entry.get("shared")
+        if has_config and shared:
+            errors.append(
+                f"{label}: step must have either 'config' (inline) or 'shared' "
+                "(reference), not both")
+        elif not has_config and not shared:
+            errors.append(f"{label}: step requires either inline 'config' or a 'shared' reference")
+        elif shared:
+            errors.extend(self._validate_shared_ref(label, stype, shared))
+        elif not isinstance(entry["config"], dict):
+            errors.append(f"{label}: config must be a JSON object")
+        else:
+            errors.extend(self._validate_step_config(stype, entry["config"], label))
+        return errors
+
+    def _validate_shared_ref(self, label: str, stype: str, shared) -> list[str]:
+        if not isinstance(shared, dict):
+            return [f"{label}: shared reference must be a JSON object"]
+        errors: list[str] = []
+        kind = shared.get("kind")
+        ident = shared.get("id")
+        version = shared.get("version")
+        expected_kind = STEP_TYPE_TO_SHARED_KIND[stype]
+        if kind != expected_kind:
+            errors.append(
+                f"{label}: shared kind {kind!r} does not match step type {stype!r} "
+                f"(expected kind {expected_kind!r})")
+        if not ident:
+            errors.append(f"{label}: shared reference requires id")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            errors.append(f"{label}: shared reference requires a positive integer version")
+        elif kind and ident and not self._shared_step_exists(kind, ident, version):
+            errors.append(f"{label}: shared {kind} {ident!r} version {version} does not exist")
+        return errors
+
+    def _validate_step_config(self, stype: str, cfg: dict, label: str) -> list[str]:
+        """Validate one step's concrete config by dispatching on type."""
+        if stype == "enrich":
+            return self._validate_enrich_config(cfg, label)
+        if stype == "transform":
+            return self._validate_transform_config(cfg, label)
+        return self._validate_condition_config(stype, cfg, label)
+
+    def _validate_enrich_config(self, cfg: dict, label: str) -> list[str]:
+        errors: list[str] = []
+        for key in ("source_key_field", "target_table", "target_key_col", "lookup_name"):
+            if not cfg.get(key):
+                errors.append(f"{label}: enrich requires {key}")
+
+        src = cfg.get("source_key_field")
+        if src and not _valid_source_path(str(src)):
+            errors.append(
+                f"{label}: enrich source_key_field {src!r} is not a known canonical path")
+
+        for key in ("target_table", "target_key_col"):
+            val = cfg.get(key)
+            if val and not is_valid_identifier(str(val)):
+                errors.append(f"{label}: enrich {key}={val!r} is not a valid SQL identifier")
+
+        fields = cfg.get("fields")
+        if not isinstance(fields, list) or not fields:
+            errors.append(f"{label}: enrich requires a non-empty fields array")
+        else:
+            for i, fld in enumerate(fields):
+                if not isinstance(fld, str) or not is_valid_identifier(fld):
+                    errors.append(
+                        f"{label}: enrich fields[{i}]={fld!r} is not a valid SQL identifier")
+
+        db_type = (cfg.get("db_type") or "sqlite").lower()
+        if db_type not in _ENRICH_DB_TYPES:
+            errors.append(
+                f"{label}: unsupported db_type {db_type!r} "
+                f"(use sqlite, postgresql, or mysql)")
+        elif db_type == "sqlite":
+            if not cfg.get("lookup_db_path"):
+                errors.append(f"{label}: lookup_db_path is required for db_type=sqlite")
+        elif not cfg.get("connection_string"):
+            errors.append(
+                f"{label}: connection_string is required for db_type={db_type!r}")
+        return errors
+
+    def _validate_transform_config(self, cfg: dict, label: str) -> list[str]:
+        errors: list[str] = []
+        rules = cfg.get("rules")
+        if not isinstance(rules, list):
+            errors.append(f"{label}: transform rules must be a JSON array")
+            return errors
+        for i, rule in enumerate(rules):
+            rlabel = f"{label}: rules[{i}]"
+            if not isinstance(rule, dict):
+                errors.append(f"{rlabel}: rule must be a JSON object")
+                continue
+            src = rule.get("source")
+            if not src or not isinstance(src, str):
+                errors.append(f"{rlabel}: rule requires a source path")
+            elif not _valid_source_path(src):
+                errors.append(f"{rlabel}: unknown source field {src!r}")
+            tgt = rule.get("target")
+            if not tgt or not isinstance(tgt, str):
+                errors.append(f"{rlabel}: rule requires a target path")
+            elif not _valid_target_path(tgt):
+                errors.append(f"{rlabel}: unknown target field {tgt!r}")
+            elif _canonical_index_zero(tgt) in _IDENTIFIER_OBJECT_PATHS:
+                errors.append(
+                    f"{rlabel}: target {tgt!r} addresses a whole Identifier "
+                    "object — write to .value / .system / .type leaves instead")
+            fn = rule.get("fn")
+            if fn is not None and fn not in TRANSFORM_FN_REGISTRY:
+                errors.append(f"{rlabel}: unknown transform fn {fn!r}")
+            if rule.get("fn_args") is not None and not isinstance(rule.get("fn_args"), dict):
+                errors.append(f"{rlabel}: fn_args must be a JSON object")
+            if rule.get("required") is not None and not isinstance(rule.get("required"), bool):
+                errors.append(f"{rlabel}: required must be a boolean")
+        return errors
+
+    def _validate_condition_config(self, stype: str, cfg: dict, label: str) -> list[str]:
+        """Filter/assert: expression must statically validate against the
+        field catalog (``lookups.*`` allowed as a runtime namespace) and
+        ``on_fail`` must be within the type's vocabulary (plan §3 D10)."""
+        errors: list[str] = []
+        expr = cfg.get("expression")
+        if not isinstance(expr, dict) or not expr:
+            errors.append(f"{label}: {stype} requires an expression object")
+        else:
+            for e in validate_expression(expr, _CATALOG_PATHS,
+                                         allow_prefixes=("lookups.",)):
+                errors.append(f"{label}: {e.removeprefix('<root>: ')}")
+        allowed = FILTER_ON_FAIL if stype == "filter" else ASSERT_ON_FAIL
+        on_fail = cfg.get("on_fail")
+        if on_fail is not None and on_fail not in allowed:
+            errors.append(
+                f"{label}: {stype} on_fail must be one of {', '.join(allowed)} "
+                f"(got {on_fail!r})")
+        return errors
+
+    @staticmethod
+    def _normalize_step_config(stype: str, cfg: dict) -> dict:
+        """Fill defaults so resolved step configs are self-describing."""
+        cfg = dict(cfg or {})
+        if stype == "enrich":
+            cfg.setdefault("db_type", "sqlite")
+        elif stype in ("filter", "assert"):
+            cfg.setdefault("on_fail", "dead_letter")
+        return cfg
+
+    @staticmethod
+    def _parse_json(value, default=None):
         if value is None:
             return default
         if isinstance(value, (dict, list)):
@@ -484,35 +745,49 @@ class ChannelConfigRegistry:
         except (TypeError, ValueError):
             return default
 
+    # --- loading -----------------------------------------------------------
+
+    def _resolve_pipeline(self, conn, raw) -> list[dict]:
+        """Parse the stored ``pipeline`` JSON and resolve shared refs into
+        concrete configs. Emits the ordered, resolved step list the runner
+        consumes (D4: array order is the ordering authority).
+
+        The original shared reference is kept under ``shared_ref`` for UI
+        round-tripping — it is deliberately NOT ``shared``, so a loaded
+        config re-validates cleanly as an inline step."""
+        resolved = []
+        for entry in self._parse_json(raw, []) or []:
+            if not isinstance(entry, dict):
+                continue
+            e = {
+                "step_id": entry.get("step_id") or "",
+                "type": entry.get("type"),
+                "description": entry.get("description"),
+            }
+            shared = entry.get("shared")
+            if isinstance(shared, dict):
+                cfg = self._get_shared_step_config(
+                    shared.get("kind"), shared.get("id"), shared.get("version"), conn
+                ) or {}
+                e["shared_ref"] = dict(shared)
+            else:
+                cfg = entry.get("config") or {}
+            e["config"] = self._normalize_step_config(e["type"], cfg)
+            resolved.append(e)
+        return resolved
+
     def _row_to_config(self, conn, row) -> dict:
         config = dict(row)
+        config["enabled"] = bool(row["enabled"])
         config["inbound_transport_config"] = self._parse_json(row["inbound_transport_config"], {})
         config["destination_config"] = self._parse_json(row["destination_config"], {})
-        config["semantics"] = self._parse_json(row["semantics"], None)
-
-        # resolve reusable references
-        config["mapping_rules"] = []
-        if row["mapping_id"] and row["mapping_version"]:
-            mrow = conn.execute(
-                "SELECT rules FROM mappings WHERE mapping_id = ? AND version = ?",
-                (row["mapping_id"], row["mapping_version"]),
-            ).fetchone()
-            if mrow:
-                config["mapping_rules"] = self._parse_json(mrow["rules"], [])
-
-        config["enrichment"] = None
-        if row["enrichment_id"] and row["enrichment_version"]:
-            erow = conn.execute(
-                "SELECT * FROM enrichments WHERE enrichment_id = ? AND version = ?",
-                (row["enrichment_id"], row["enrichment_version"]),
-            ).fetchone()
-            if erow:
-                config["enrichment"] = dict(erow)
+        config["pipeline"] = self._resolve_pipeline(conn, row["pipeline"])
 
         config["retry_policy"] = {"max_retries": 3, "base_backoff_seconds": 2}
         if row["retry_policy_id"]:
             prow = conn.execute(
-                "SELECT max_retries, base_backoff_seconds FROM retry_policies WHERE retry_policy_id = ?",
+                "SELECT max_retries, base_backoff_seconds FROM retry_policies "
+                "WHERE retry_policy_id = ?",
                 (row["retry_policy_id"],),
             ).fetchone()
             if prow:
@@ -533,10 +808,13 @@ class ChannelConfigRegistry:
 
     def load_config(self, channel_id: str) -> dict | None:
         with self._get_conn() as conn:
-            row = conn.execute("SELECT * FROM channels WHERE channel_id = ?", (channel_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM channels WHERE channel_id = ?", (channel_id,)
+            ).fetchone()
         if not row:
             return None
         return self._row_to_config(conn, row)
+
     # --- builders ----------------------------------------------------------
 
     def _build_destination(self, config: dict):
@@ -566,64 +844,65 @@ class ChannelConfigRegistry:
             )
         return None
 
-    def _build_enrichment(self, config: dict):
-        enr = config.get("enrichment")
-        if not enr:
-            return None
-
-        db_type = (enr.get("db_type") or "sqlite").lower()
-
-        # Build the adapter first so we can validate at build time.
+    def _build_enrich_step(self, cfg: dict, step_id: str) -> BatchLookup:
+        """Build-time validation + BatchLookup construction for one enrich
+        step: the lookup DB must be reachable and the table/columns must
+        exist before the channel is allowed to run."""
+        db_type = (cfg.get("db_type") or "sqlite").lower()
+        label = f"enrich step {step_id or '?'!r}"
         if db_type == "sqlite":
-            adapter = build_adapter("sqlite", db_path=enr["lookup_db_path"])
+            adapter = build_adapter("sqlite", db_path=cfg["lookup_db_path"])
         else:
-            cs = enr.get("connection_string")
-            if not cs:
-                raise ConfigValidationError(
-                    f"enrichment {enr['enrichment_id']!r}: connection_string required for db_type={db_type!r}"
-                )
-            adapter = build_adapter(db_type, connection_string=cs)
+            adapter = build_adapter(db_type, connection_string=cfg["connection_string"])
 
-        # Build-time validation: check the DB is accessible and the target
-        # table / columns exist.
         try:
             adapter.validate()
         except Exception as e:
             raise ConfigValidationError(
-                f"enrichment {enr['enrichment_id']!r}: cannot connect to {db_type} db: {e}"
-            ) from e
+                f"{label}: cannot connect to {db_type} db: {e}") from e
 
-        if not adapter.table_exists(enr["target_table"]):
+        if not adapter.table_exists(cfg["target_table"]):
             raise ConfigValidationError(
-                f"enrichment {enr['enrichment_id']!r}: table {enr['target_table']!r} not found in {db_type} db"
-            )
+                f"{label}: table {cfg['target_table']!r} not found in {db_type} db")
 
-        cols = adapter.column_names(enr["target_table"])
-        if enr["target_key_col"] not in cols:
+        cols = adapter.column_names(cfg["target_table"])
+        if cfg["target_key_col"] not in cols:
             raise ConfigValidationError(
-                f"enrichment {enr['enrichment_id']!r}: "
-                f"column {enr['target_key_col']!r} not found in table {enr['target_table']!r}"
-            )
-        fields = self._parse_json(enr["fields"], [])
-        for fld in fields:
+                f"{label}: column {cfg['target_key_col']!r} not found "
+                f"in table {cfg['target_table']!r}")
+        for fld in cfg.get("fields") or []:
             if fld not in cols:
                 raise ConfigValidationError(
-                    f"enrichment {enr['enrichment_id']!r}: "
-                    f"field {fld!r} not found in table {enr['target_table']!r}"
-                )
+                    f"{label}: field {fld!r} not found in table {cfg['target_table']!r}")
 
         return BatchLookup(
-            source_key_field=enr["source_key_field"],
-            target_table=enr["target_table"],
-            target_key_col=enr["target_key_col"],
-            fields=fields,
-            lookup_name=enr["lookup_name"],
+            source_key_field=cfg.get("source_key_field", ""),
+            target_table=cfg["target_table"],
+            target_key_col=cfg["target_key_col"],
+            fields=list(cfg.get("fields") or []),
+            lookup_name=cfg.get("lookup_name", ""),
             db_adapter=adapter,
         )
 
+    def _build_pipeline_steps(self, config: dict) -> list[Step]:
+        """Builds the ordered runtime ``Step`` chain from a resolved config.
+        Enrich steps get full build-time DB validation; structural problems
+        surface as ConfigValidationError (fail before runtime)."""
+        steps: list[Step] = []
+        for entry in config.get("pipeline") or []:
+            try:
+                step = build_step(entry)
+            except ValueError as e:
+                raise ConfigValidationError(
+                    f"pipeline step {entry.get('step_id')!r}: {e}") from e
+            if step.type == "enrich":
+                step.impl = self._build_enrich_step(step.config, step.step_id)
+            steps.append(step)
+        return steps
+
     def build_runner(self, channel_id: str, queue, destination=None) -> ChannelRunner:
         """Instantiates a ChannelRunner for a channel from its declarative
-        references. Validates the config first — invalid channels fail here,
+        config. Validates the config first — invalid channels fail here,
         before runtime. `destination` may override the configured destination
         (test seam)."""
         self.load_all_configs()
@@ -634,16 +913,14 @@ class ChannelConfigRegistry:
         if errors:
             raise ConfigValidationError("; ".join(errors))
 
-        mapper = FieldMapper(config.get("mapping_rules", [])) if config.get("mapping_id") else None
-        enricher = self._build_enrichment(config)
+        steps = self._build_pipeline_steps(config)
         rp = config.get("retry_policy") or {}
 
         return ChannelRunner(
             channel_id=channel_id,
             queue=queue,
-            mapper=mapper,
+            steps=steps,
             destination=destination if destination is not None else self._build_destination(config),
-            enricher=enricher,
             inbound_codec=config["inbound_codec"],
             outbound_codec=config["outbound_codec"],
             max_retries=rp.get("max_retries", 3),
@@ -701,3 +978,9 @@ class ChannelConfigRegistry:
                 inbound_codec=inbound_codec,
             )
         return None
+
+
+
+
+
+

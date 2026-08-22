@@ -13,6 +13,7 @@ class MessageState(Enum):
     PROCESSING = "PROCESSING"
     DELIVERED = "DELIVERED"
     DEAD_LETTER = "DEAD_LETTER"
+    DISCARDED = "DISCARDED"
 
 
 @dataclass

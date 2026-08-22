@@ -302,6 +302,8 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
     """
     from nodes.codec import keys as codec_keys
     from api.ui.helpers import codec_label
+    from core.field_catalog import catalog_for_codec
+    from api.ui.fields import STEP_TYPE_META
 
     if config is None:
         config = {
@@ -310,8 +312,7 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
             "inbound_transport": "http_webhook", "inbound_transport_config": {},
             "inbound_codec": "json", "outbound_codec": "json",
             "destination": "http", "destination_config": {"endpoint_url": ""},
-            "mapping_id": "", "mapping_version": "", "enrichment_id": "",
-            "enrichment_version": "", "retry_policy_id": "default", "semantics": None,
+            "retry_policy_id": "default", "pipeline": [],
         }
 
     trans_cfg = config.get("inbound_transport_config") or {}
@@ -335,12 +336,7 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
                      "selected": d == selected_dest}
                     for d in sorted(_DESTINATION_FIELDS)]
 
-    mappings = [{"value": m["mapping_id"], "label": f"{m['mapping_id']} v{m['version']}",
-                 "selected": m["mapping_id"] == config.get("mapping_id")}
-                for m in registry.list_mappings()]
-    enrichments = [{"value": e["enrichment_id"], "label": f"{e['enrichment_id']} v{e['version']}",
-                    "selected": e["enrichment_id"] == config.get("enrichment_id")}
-                   for e in registry.list_enrichments()]
+    shared_steps = registry.list_shared_steps()
     retry_policies = [{"value": rp["retry_policy_id"], "label": rp["retry_policy_id"],
                        "selected": rp["retry_policy_id"] == config.get("retry_policy_id")}
                       for rp in registry.list_retry_policies()]
@@ -367,18 +363,35 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
                        for name, label, ftype, default, placeholder, required in fields],
         })
 
+    pipeline = config.get("pipeline") or []
+    if not isinstance(pipeline, list):
+        pipeline = []
+
+    # Serialize pipeline for the hidden field in the step-chain builder.
+    pipeline_json = json.dumps(pipeline)
+
+    # Build the field catalog for the selected inbound codec so the
+    # step-chain builder can show friendly labels with codec hints.
+    field_catalog_raw = catalog_for_codec(selected_codec)
+    field_catalog = [
+        {
+            "path": d.path,
+            "label": d.label,
+            "kind": d.kind,
+            "group": d.group,
+            "hint": getattr(d, "_hint", None),
+        }
+        for d in field_catalog_raw
+    ]
+
     tmpl_config = {
         "channel_id": config.get("channel_id", ""),
         "name": config.get("name", ""),
         "status": config.get("status", "running"),
         "concurrency": config.get("concurrency", 1),
         "enabled": config.get("enabled", True),
-        "mapping_version": config.get("mapping_version") or "",
-        "enrichment_version": config.get("enrichment_version") or "",
-        "semantics": config.get("semantics"),
+        "pipeline": json.dumps(pipeline, indent=2) if pipeline else "",
     }
-    if isinstance(tmpl_config["semantics"], (dict, list)):
-        tmpl_config["semantics"] = json.dumps(tmpl_config["semantics"], indent=2)
 
     return render_template(
         "channel_form.html",
@@ -389,12 +402,14 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
         destinations=destinations,
         transport_groups=transport_groups,
         dest_groups=dest_groups,
-        mappings=mappings,
-        enrichments=enrichments,
+        shared_steps=shared_steps,
         retry_policies=retry_policies,
         flash_errors=flash_errors,
         flash_success=flash_success,
         initial_step=initial_step,
+        field_catalog=field_catalog,
+        step_type_meta=STEP_TYPE_META,
+        pipeline_json=pipeline_json,
     )
 
 
@@ -465,6 +480,14 @@ def save_channel():
         except Exception as e:
             raise ConfigValidationError(f"Invalid JSON for {name}: {e}")
 
+    def _pipeline_from_request():
+        pipeline = _json_field("pipeline", [])
+        if pipeline is None:
+            pipeline = []
+        if not isinstance(pipeline, list):
+            raise ConfigValidationError("pipeline must be a JSON array of steps")
+        return pipeline
+
     inbound_transport = request.form.get("inbound_transport", "")
     destination = request.form.get("destination", "")
 
@@ -498,12 +521,8 @@ def save_channel():
             "outbound_codec": request.form.get("outbound_codec", ""),
             "destination": destination,
             "destination_config": destination_config,
-            "mapping_id": request.form.get("mapping_id", ""),
-            "mapping_version": _int_field("mapping_version", 0) or None,
-            "enrichment_id": request.form.get("enrichment_id", ""),
-            "enrichment_version": _int_field("enrichment_version", 0) or None,
             "retry_policy_id": request.form.get("retry_policy_id", ""),
-            "semantics": request.form.get("semantics", "").strip() or None,
+            "pipeline": _pipeline_from_request(),
         }
 
     if not is_edit and not CHANNEL_ID_RE.match(channel_id):
@@ -526,12 +545,8 @@ def save_channel():
             "outbound_codec": request.form.get("outbound_codec", ""),
             "destination": destination,
             "destination_config": destination_config,
-            "mapping_id": request.form.get("mapping_id", "") or None,
-            "mapping_version": _int_field("mapping_version", 0) or None,
-            "enrichment_id": request.form.get("enrichment_id", "") or None,
-            "enrichment_version": _int_field("enrichment_version", 0) or None,
             "retry_policy_id": request.form.get("retry_policy_id", "") or None,
-            "semantics": _json_field("semantics", None),
+            "pipeline": _pipeline_from_request(),
         }
         registry.save_channel_definition(definition)
     except ConfigValidationError as e:

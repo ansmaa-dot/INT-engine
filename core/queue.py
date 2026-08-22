@@ -253,6 +253,34 @@ class PersistentQueue:
         self.record_audit(trace_id, self._channel_for(trace_id), "dead_lettered",
                            {"attempts": attempts, "error": error})
 
+    def mark_discarded(self, trace_id: str, attempts: int, error: dict):
+        """Filters a message out permanently (filter on_fail=discard).
+        
+        Distinct from ``mark_dead_letter`` — a filtered-out message was
+        correctly excluded by design, not a failure needing attention.
+        Uses its own ``DISCARDED`` state and ``discarded`` audit event
+        so DLQ counts and discard counts never merge (D6/D9).
+        """
+        discarded_state = (
+            MessageState.DISCARDED.value
+            if hasattr(MessageState.DISCARDED, "value")
+            else str(MessageState.DISCARDED)
+        ).upper()
+
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE queue 
+                SET state = ?, attempts = ?, error = ?, next_retry_at = NULL
+                WHERE trace_id = ?
+            """,
+                (discarded_state, attempts, _json_text(error), trace_id),
+            )
+            conn.commit()
+
+        self.record_audit(trace_id, self._channel_for(trace_id), "discarded",
+                           {"attempts": attempts, "error": error})
+
     def mark_delivered(self, trace_id: str, canonical: CanonicalMessage | None, attempts: int = 0):
         delivered_state = (
             MessageState.DELIVERED.value

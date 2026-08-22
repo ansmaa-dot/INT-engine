@@ -8,6 +8,7 @@ from core.message import Envelope
 from core.queue import PersistentQueue
 from engine.config_loader import ChannelConfigRegistry, ConfigValidationError
 from engine.runner import ChannelRunner
+from engine.steps import Step, build_step
 from nodes.base import EnrichmentNode
 from nodes.enrichment.batch_lookup import BatchLookup
 from nodes.enrichment.db_adapter import (
@@ -289,28 +290,26 @@ def test_build_adapter_unknown_type_raises():
 # ---------------------------------------------------------------------------
 
 
+
 def test_runner_enrichment_and_mapper_integration(tmp_path):
     db = _ref_db(tmp_path, [{"mrn": "42", "name": "Grace Hopper"}])
 
     q = PersistentQueue(str(tmp_path / "q.db"))
     rec = RecordingDest()
 
-    bl = BatchLookup(
-        db_path=db,
-        source_key_field="patient.identifiers.0.value",
-        target_table="patients",
-        target_key_col="mrn",
-        fields=["name"],
-        lookup_name="pt",
-    )
-    mapper = FieldMapper([
-        {"source": "lookups.pt.name", "target": "extensions.patient_name"}
-    ])
+    steps = [
+        build_step({"step_id": "e1", "type": "enrich", "config": {
+            "source_key_field": "patient.identifiers.0.value",
+            "lookup_db_path": db, "target_table": "patients",
+            "target_key_col": "mrn", "fields": ["name"], "lookup_name": "pt"}}),
+        build_step({"step_id": "t1", "type": "transform", "config": {
+            "rules": [{"source": "lookups.pt.name",
+                       "target": "extensions.patient_name"}]}}),
+    ]
 
     runner = ChannelRunner(
         "c1", q,
-        mapper=mapper,
-        enricher=bl,
+        steps=steps,
         destination=rec,
         inbound_codec="json",
         outbound_codec="json",
@@ -335,11 +334,13 @@ def test_runner_enrichment_failure_is_permanent_dlq(tmp_path):
         def enrich_batch(self, envelopes):
             raise RuntimeError("lookup db is down")
 
+    steps = [Step(step_id="e1", type="enrich", config={}, impl=BrokenEnricher())]
     runner = ChannelRunner(
         "c1", q,
-        enricher=BrokenEnricher(),
+        steps=steps,
         inbound_codec="json",
         outbound_codec="json",
+        max_retries=3,
     )
 
     env = Envelope(channel_id="c1", raw='{"patient": {}}', inbound_codec="json")
@@ -348,143 +349,64 @@ def test_runner_enrichment_failure_is_permanent_dlq(tmp_path):
     assert runner.process_one() is True  # "did work" — not "did succeed"
     with q._get_conn() as conn:
         row = conn.execute(
-            "SELECT state FROM queue WHERE trace_id = ?", (env.trace_id,)
+            "SELECT state, error FROM queue WHERE trace_id = ?", (env.trace_id,)
         ).fetchone()
     assert row is not None
     assert row["state"] == "DEAD_LETTER"
+    err = json.loads(row["error"])
+    assert err["stage"] == "enrichment"
+    assert err["step_id"] == "e1"
+    assert err["step_type"] == "enrich"
+
 
 # ---------------------------------------------------------------------------
-# Config registry: enrichment save/load
+# Config registry: shared enrichment definitions (save_shared_step)
 # ---------------------------------------------------------------------------
+
+
+def _enrich_cfg(tmp_path, **overrides):
+    cfg = {
+        "source_key_field": "patient.identifiers.0.value",
+        "lookup_db_path": str(tmp_path / "ref.db"),
+        "target_table": "patients",
+        "target_key_col": "mrn",
+        "fields": ["name"],
+        "lookup_name": "x",
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _channel(channel_id, pipeline):
+    return {
+        "channel_id": channel_id, "name": channel_id, "enabled": True,
+        "status": "running", "concurrency": 1,
+        "inbound_transport": "http_webhook", "inbound_transport_config": {},
+        "inbound_codec": "json", "outbound_codec": "json",
+        "destination": "http", "destination_config": {"endpoint_url": "http://x/api"},
+        "retry_policy_id": "default",
+        "pipeline": pipeline,
+    }
 
 
 def test_save_enrichment_rejects_invalid_identifier(tmp_path):
     r = _reg(tmp_path)
     with pytest.raises(ConfigValidationError, match="not a valid SQL identifier"):
-        r.save_enrichment(
-            "bad", source_key_field="x",
-            lookup_db_path=str(tmp_path / "r.db"),
-            target_table="bad;table",
-            target_key_col="mrn",
-            fields=["name"],
-            lookup_name="x",
-        )
+        r.save_shared_step("enrichment", "bad",
+                           _enrich_cfg(tmp_path, target_table="bad;table"))
 
 
 def test_save_enrichment_rejects_unsupported_db_type(tmp_path):
     r = _reg(tmp_path)
     with pytest.raises(ConfigValidationError, match="unsupported db_type"):
-        r.save_enrichment(
-            "bad", source_key_field="x",
-            lookup_db_path=str(tmp_path / "r.db"),
-            target_table="patients",
-            target_key_col="mrn",
-            fields=["name"],
-            lookup_name="x",
-            db_type="oracle",
-        )
+        r.save_shared_step("enrichment", "bad",
+                           _enrich_cfg(tmp_path, db_type="oracle"))
 
 
 def test_save_enrichment_requires_connection_string_for_external(tmp_path):
     r = _reg(tmp_path)
     with pytest.raises(ConfigValidationError, match="connection_string is required"):
-        r.save_enrichment(
-            "bad", source_key_field="x",
-            lookup_db_path=str(tmp_path / "r.db"),
-            target_table="patients",
-            target_key_col="mrn",
-            fields=["name"],
-            lookup_name="x",
-            db_type="postgresql",
-        )
+        r.save_shared_step("enrichment", "bad",
+                           _enrich_cfg(tmp_path, db_type="postgresql"))
 
 
-def test_save_and_build_enrichment_with_explicit_db_type(tmp_path):
-    r = _reg(tmp_path)
-    ref_db = _ref_db(tmp_path, [{"mrn": "1", "name": "Test"}])
-    v = r.save_enrichment(
-        "ext_lookup", source_key_field="patient.identifiers.0.value",
-        lookup_db_path=ref_db, target_table="patients", target_key_col="mrn",
-        fields=["name"], lookup_name="pt",
-        db_type="sqlite",
-    )
-    r.save_channel_definition({
-        "channel_id": "ext_ch", "name": "Ext", "enabled": True, "status": "running",
-        "concurrency": 1,
-        "inbound_transport": "http_webhook", "inbound_transport_config": {},
-        "inbound_codec": "json", "outbound_codec": "json",
-        "destination": "http", "destination_config": {"endpoint_url": "http://x/api"},
-        "mapping_id": None, "mapping_version": None,
-        "enrichment_id": "ext_lookup", "enrichment_version": v,
-        "retry_policy_id": "default", "semantics": None,
-    })
-
-    q = PersistentQueue(str(tmp_path / "q.db"))
-    runner = r.build_runner("ext_ch", q, destination=RecordingDest())
-    assert runner.enricher is not None
-    assert runner.enricher.lookup_name == "pt"
-
-def test_build_runner_validates_missing_table_at_build_time(tmp_path):
-    r = _reg(tmp_path)
-    ref_db = _ref_db(tmp_path, [{"mrn": "1", "name": "X"}])
-
-    with r._get_conn() as conn:
-        conn.execute(
-            """INSERT INTO enrichments
-               (enrichment_id, version, source_key_field, lookup_db_path,
-                target_table, target_key_col, fields, lookup_name,
-                db_type, connection_string, description, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("bad_tbl", 1, "patient.identifiers.0.value", ref_db,
-             "nonexistent_table", "mrn", json.dumps(["name"]), "pt",
-             "sqlite", None, "", "2024-01-01", "2024-01-01"),
-        )
-        conn.commit()
-
-    r.save_channel_definition({
-        "channel_id": "bad_tbl_ch", "name": "Bad", "enabled": True, "status": "running",
-        "concurrency": 1,
-        "inbound_transport": "http_webhook", "inbound_transport_config": {},
-        "inbound_codec": "json", "outbound_codec": "json",
-        "destination": "http", "destination_config": {"endpoint_url": "http://x/api"},
-        "mapping_id": None, "mapping_version": None,
-        "enrichment_id": "bad_tbl", "enrichment_version": 1,
-        "retry_policy_id": "default", "semantics": None,
-    })
-
-    q = PersistentQueue(str(tmp_path / "q.db"))
-    with pytest.raises(ConfigValidationError, match="table .* not found"):
-        r.build_runner("bad_tbl_ch", q, destination=RecordingDest())
-
-
-def test_build_runner_validates_missing_column_at_build_time(tmp_path):
-    r = _reg(tmp_path)
-    ref_db = _ref_db(tmp_path, [{"mrn": "1", "name": "X"}])
-
-    with r._get_conn() as conn:
-        conn.execute(
-            """INSERT INTO enrichments
-               (enrichment_id, version, source_key_field, lookup_db_path,
-                target_table, target_key_col, fields, lookup_name,
-                db_type, connection_string, description, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("bad_col", 1, "patient.identifiers.0.value", ref_db,
-             "patients", "mrn", json.dumps(["nonexistent_column"]), "pt",
-             "sqlite", None, "", "2024-01-01", "2024-01-01"),
-        )
-        conn.commit()
-
-    r.save_channel_definition({
-        "channel_id": "bad_col_ch", "name": "Bad", "enabled": True, "status": "running",
-        "concurrency": 1,
-        "inbound_transport": "http_webhook", "inbound_transport_config": {},
-        "inbound_codec": "json", "outbound_codec": "json",
-        "destination": "http", "destination_config": {"endpoint_url": "http://x/api"},
-        "mapping_id": None, "mapping_version": None,
-        "enrichment_id": "bad_col", "enrichment_version": 1,
-        "retry_policy_id": "default", "semantics": None,
-    })
-
-    q = PersistentQueue(str(tmp_path / "q.db"))
-    with pytest.raises(ConfigValidationError, match="field .* not found"):
-        r.build_runner("bad_col_ch", q, destination=RecordingDest())

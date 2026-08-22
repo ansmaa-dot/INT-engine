@@ -88,7 +88,34 @@ def test_idempotency_duplicate_rejected(tmp_path):
     assert q.enqueue(b) is False
 
 
-def test_queue_depth(tmp_path):
+def test_mark_discarded_persists_state_and_audit(tmp_path):
+    """Filter on_fail=discard writes DISCARDED state + 'discarded' audit event,
+    not DEAD_LETTER + 'dead_lettered' — they must never merge (D6/D9)."""
+    q = _mkqueue(tmp_path)
+    env = Envelope(channel_id="c1", raw="{}")
+    q.enqueue(env)
+    q.dequeue_available("c1")  # claim -> PROCESSING
+
+    err = {"stage": "filter", "code": "filter.expr", "message": "excluded by filter"}
+    q.mark_discarded(env.trace_id, 1, err)
+
+    # Not queued for reprocessing
+    assert q.dequeue_available("c1") is None
+
+    # DB row state
+    with q._get_conn() as conn:
+        row = conn.execute(
+            "SELECT state, error FROM queue WHERE trace_id = ?",
+            (env.trace_id,),
+        ).fetchone()
+    assert row["state"] == MessageState.DISCARDED.value
+    assert json.loads(row["error"]) == err
+
+    # Audit trail records 'discarded', not 'dead_lettered'
+    trail = q.get_audit_trail(env.trace_id)
+    events = [e["event"] for e in trail]
+    assert "discarded" in events
+    assert "dead_lettered" not in events
     q = _mkqueue(tmp_path)
     q.enqueue(Envelope(channel_id="c1", raw="1"))
     q.enqueue(Envelope(channel_id="c1", raw="2"))

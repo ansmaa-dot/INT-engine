@@ -59,12 +59,14 @@ def create_app() -> Flask:
     # --- domain blueprints ---
     from api.ui.channels import bp as channels_bp        # /ui/metrics, /ui/channels/*
     from api.ui.definitions import bp as defs_bp         # /ui/defs/*
+    from api.ui.fields import bp as fields_bp             # /ui/fields/*, /ui/preview, /ui/enrichments/columns
     from api.ui.messages import bp as messages_bp        # /channels/<id>/messages/*
     from api.ui.dlq import bp as dlq_bp                  # /ui/dlq/*, /ui/audit, /api/audit/*
     from api.api_routes import bp as api_bp              # /api/*, /ui/test/simulate
 
     app.register_blueprint(channels_bp)
     app.register_blueprint(defs_bp)
+    app.register_blueprint(fields_bp)
     app.register_blueprint(messages_bp)
     app.register_blueprint(dlq_bp)
     app.register_blueprint(api_bp)

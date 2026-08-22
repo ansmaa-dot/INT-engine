@@ -42,7 +42,8 @@ def codec_label(key: str) -> str:
          "hl7v2.5.1.oru_r01": "HL7 v2.5.1 ORU_R01",
          "hl7v2.5.1.adt_a01": "HL7 v2.5.1 ADT_A01",
          "hl7v2.5.1.orm_o01": "HL7 v2.5.1 ORM_O01",
-         "hl7v2.5.1.undefined": "HL7 v2.5.1 (any)"}
+         "hl7v2.5.1.undefined": "HL7 v2.5.1 (any)",
+         "fhir.r4": "FHIR R4 (JSON)"}
     return m.get(key.lower(), key)
 
 

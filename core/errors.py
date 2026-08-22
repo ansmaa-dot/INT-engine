@@ -9,6 +9,8 @@ distinguish between:
     validation  — decoded data violates the canonical model contract
     business    — semantically invalid business data
     transform   — mapping/transform step failed
+    filter      — filter-step boolean expression evaluated to false
+    assert      — assert-step boolean expression evaluated to false
     serialize   — canonical message couldn't be expressed as target format
     destination — transport/delivery failed
 
@@ -33,10 +35,24 @@ class PipelineError(Exception):
         *,
         context: dict[str, Any] | None = None,
         cause: BaseException | None = None,
+        step_id: str | None = None,
+        step_type: str | None = None,
+        retryable: bool | None = None,
     ):
         super().__init__(message)
         self.code = code
-        self.context = dict(context or {})
+        self.step_id = step_id
+        self.step_type = step_type
+        self.retryable = retryable
+
+        # Merge step identity into context for audit/error serialization.
+        merged = dict(context or {})
+        if step_id is not None:
+            merged.setdefault("step_id", step_id)
+        if step_type is not None:
+            merged.setdefault("step_type", step_type)
+        self.context = merged
+
         self.cause = cause
 
     def __str__(self) -> str:
@@ -65,6 +81,29 @@ class TransformError(PipelineError):
 
 class EnrichmentError(PipelineError):
     stage = "enrichment"
+
+
+class FilterError(PipelineError):
+    """Raised when a filter step's boolean expression evaluates to false.
+
+    The ``on_fail`` action (dead_letter or discard) is set by the caller
+    and determines how the runner handles this error. The error itself is
+    always non-retryable by default — the filter made a clean decision,
+    there is nothing to retry.
+    """
+
+    stage = "filter"
+
+
+class AssertError(PipelineError):
+    """Raised when an assert step's boolean expression evaluates to false.
+
+    Retryability is determined by the step's ``on_fail`` setting:
+      - ``on_fail=retry`` → retryable (transient condition)
+      - ``on_fail=dead_letter`` → not retryable (persistent failure)
+    """
+
+    stage = "assert"
 
 
 class SerializeError(PipelineError):

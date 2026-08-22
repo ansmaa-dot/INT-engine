@@ -1,10 +1,16 @@
 import json
+import sqlite3
 
 import pytest
 
 from core.message import Envelope
 from core.queue import PersistentQueue
-from engine.config_loader import ChannelConfigRegistry, ConfigValidationError, DESTINATIONS, TRANSPORTS
+from engine.config_loader import (
+    ChannelConfigRegistry,
+    ConfigValidationError,
+    DESTINATIONS,
+    TRANSPORTS,
+)
 from engine.runner import ChannelRunner
 from nodes.transform.field_mapper import FieldMapper
 
@@ -20,12 +26,48 @@ def _valid(channel_id="c1", **overrides):
         "inbound_transport": "http_webhook", "inbound_transport_config": {},
         "inbound_codec": "json", "outbound_codec": "json",
         "destination": "http", "destination_config": {"endpoint_url": "http://x/api"},
-        "mapping_id": None, "mapping_version": None,
-        "enrichment_id": None, "enrichment_version": None,
-        "retry_policy_id": "default", "semantics": None,
+        "pipeline": [],
+        "retry_policy_id": "default",
     }
     d.update(overrides)
     return d
+
+
+def _transform_step(step_id="t1", rules=None, description=None):
+    entry = {
+        "step_id": step_id, "type": "transform",
+        "config": {"rules": rules or [{"source": "patient.name", "target": "patient.name"}]},
+    }
+    if description is not None:
+        entry["description"] = description
+    return entry
+
+
+def _enrich_step(step_id="e1", lookup_db_path="/tmp/ref.db", **overrides):
+    cfg = {
+        "source_key_field": "patient.identifiers.0.value",
+        "lookup_db_path": lookup_db_path,
+        "target_table": "patients",
+        "target_key_col": "mrn",
+        "fields": ["name"],
+        "lookup_name": "pt",
+    }
+    cfg.update(overrides)
+    return {"step_id": step_id, "type": "enrich", "config": cfg}
+
+
+def _filter_step(step_id="f1", expression=None, on_fail=None):
+    cfg = {"expression": expression or {"truthy": [{"var": ["patient.name"]}]}}
+    if on_fail is not None:
+        cfg["on_fail"] = on_fail
+    return {"step_id": step_id, "type": "filter", "config": cfg}
+
+
+def _assert_step(step_id="a1", expression=None, on_fail=None):
+    cfg = {"expression": expression or {"not_empty": [{"var": ["patient.name"]}]}}
+    if on_fail is not None:
+        cfg["on_fail"] = on_fail
+    return {"step_id": step_id, "type": "assert", "config": cfg}
 
 
 class RecordingDestination:
@@ -39,15 +81,51 @@ class RecordingDestination:
         self.sent.append(message.content)
 
 
+# ---------------------------------------------------------------------------
+# schema / seeding
+# ---------------------------------------------------------------------------
+
+
+
 def test_seed_defaults(tmp_path):
     r = _registry(tmp_path)
     assert "default" in [p["retry_policy_id"] for p in r.list_retry_policies()]
     assert "his_to_lis" in r.load_all_configs()
+    # shared identity mapping + demo channel with an empty pipeline
+    shared = r.list_shared_steps("mapping")
+    assert {"kind": "mapping", "id": "identity", "version": 1,
+            "description": "identity mapping (no changes)"} in shared
+    assert r.load_all_configs()["his_to_lis"]["pipeline"] == []
+
+
+def test_schema_hard_reset_on_version_mismatch(tmp_path):
+    db = str(tmp_path / "cfg.db")
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE mappings (mapping_id TEXT, version INT, rules TEXT)")
+        c.execute("INSERT INTO mappings VALUES ('legacy', 1, '[]')")
+        c.commit()  # user_version stays 0 -> mismatch on open
+    r = ChannelConfigRegistry(db)
+    with r._get_conn() as c:
+        tables = {row[0] for row in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "mappings" not in tables
+        assert "shared_steps" in tables
+        assert "pipeline_steps" in tables
+        assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+    # reseeded from scratch
+    assert "his_to_lis" in r.load_all_configs()
+
+
+# ---------------------------------------------------------------------------
+# basic channel validation (unchanged contract)
+# ---------------------------------------------------------------------------
 
 
 def test_valid_channel_validates_clean(tmp_path):
     r = _registry(tmp_path)
     assert r.validate_channel_definition(_valid()) == []
+    assert r.validate_channel_definition(_valid(pipeline=[
+        _transform_step(), _filter_step(), _assert_step()])) == []
 
 
 def test_unknown_codec_rejected(tmp_path):
@@ -64,16 +142,6 @@ def test_unknown_transport_rejected(tmp_path):
 def test_unknown_destination_rejected(tmp_path):
     r = _registry(tmp_path)
     assert any("destination" in e for e in r.validate_channel_definition(_valid(destination="pigeon")))
-
-
-def test_missing_mapping_reference_rejected(tmp_path):
-    r = _registry(tmp_path)
-    assert any("mapping" in e for e in r.validate_channel_definition(_valid(mapping_id="ghost", mapping_version=1)))
-
-
-def test_mapping_version_required(tmp_path):
-    r = _registry(tmp_path)
-    assert any("mapping_version" in e for e in r.validate_channel_definition(_valid(mapping_id="identity")))
 
 
 def test_missing_retry_policy_rejected(tmp_path):
@@ -93,53 +161,293 @@ def test_invalid_save_raises_and_does_not_persist(tmp_path):
     with pytest.raises(ConfigValidationError):
         r.save_channel_definition(_valid(inbound_codec="nope"))
     assert "c1" not in r.load_all_configs()
+
+
+def test_pipeline_must_be_array(tmp_path):
+    r = _registry(tmp_path)
+    assert any("pipeline must be a JSON array" in e
+               for e in r.validate_channel_definition(_valid(pipeline={"type": "transform"})))
+
+
+# ---------------------------------------------------------------------------
+# pipeline step validation (fail-fast)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_step_type_rejected(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        {"step_id": "s", "type": "explode", "config": {}}]))
+    assert any("unknown step type" in e for e in errors)
+
+
+def test_step_requires_config_or_shared(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        {"step_id": "s", "type": "transform"}]))
+    assert any("requires either inline 'config' or a 'shared' reference" in e for e in errors)
+
+
+def test_step_cannot_have_both_config_and_shared(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        {"step_id": "s", "type": "transform", "config": {"rules": []},
+         "shared": {"kind": "mapping", "id": "identity", "version": 1}}]))
+    assert any("not both" in e for e in errors)
+
+
+def test_inline_step_id_assigned_and_duplicates_rejected(tmp_path):
+    r = _registry(tmp_path)
+    r.save_channel_definition(_valid("auto", pipeline=[
+        {"type": "transform", "config": {"rules": []}}]))
+    cfg = r.load_all_configs()["auto"]
+    assert cfg["pipeline"][0]["step_id"]  # assigned on save
+
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _transform_step("dup"), _transform_step("dup")]))
+    assert any("duplicate step_id" in e for e in errors)
+
+
+def test_missing_shared_reference_rejected(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        {"step_id": "s1", "type": "transform",
+         "shared": {"kind": "mapping", "id": "ghost", "version": 1}}]))
+    assert any("version 1 does not exist" in e for e in errors)
+
+
+def test_shared_reference_version_required(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        {"step_id": "s1", "type": "transform",
+         "shared": {"kind": "mapping", "id": "identity"}}]))
+    assert any("positive integer version" in e for e in errors)
+
+
+def test_shared_kind_must_match_step_type(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        {"step_id": "s1", "type": "transform",
+         "shared": {"kind": "enrichment", "id": "identity", "version": 1}}]))
+    assert any("does not match step type" in e for e in errors)
+
+
+def test_unknown_transform_source_target_fn_rejected(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _transform_step("t", [{"source": "patient.nope", "target": "patient.name",
+                               "fn": "NotExist"}])]))
+    assert any("unknown source field" in e for e in errors)
+    assert any("unknown transform fn" in e for e in errors)
+
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _transform_step("t", [{"source": "patient.name", "target": "x.y.z"}])]))
+    assert any("unknown target field" in e for e in errors)
+
+
+def test_whole_identifier_object_target_rejected(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _transform_step("t", [{"source": "patient.name", "target": "patient.identifiers.0"}])]))
+    # whole-Identifier-object targets are not catalog leaves — rejected
+    assert any("unknown target field" in e for e in errors)
+
+
+def test_filter_on_fail_vocabulary(tmp_path):
+    r = _registry(tmp_path)
+    assert r.validate_channel_definition(_valid(pipeline=[
+        _filter_step("f", on_fail="discard")])) == []
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _filter_step("f", on_fail="retry")]))
+    assert any("filter on_fail must be one of" in e for e in errors)
+
+
+def test_assert_on_fail_vocabulary(tmp_path):
+    r = _registry(tmp_path)
+    assert r.validate_channel_definition(_valid(pipeline=[
+        _assert_step("a", on_fail="retry")])) == []
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _assert_step("a", on_fail="discard")]))
+    assert any("assert on_fail must be one of" in e for e in errors)
+
+
+def test_condition_expression_unknown_field_rejected(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _filter_step("f", {"truthy": [{"var": ["patient.nope"]}]})]))
+    assert any("unknown canonical field" in e for e in errors)
+
+    # lookups.* is the runtime enrichment namespace — statically allowed
+    assert r.validate_channel_definition(_valid(pipeline=[
+        _assert_step("a", {"not_empty": [{"var": ["lookups.pt.name"]}]})])) == []
+
+
+def test_inline_enrich_validation(tmp_path):
+    r = _registry(tmp_path)
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _enrich_step("e", target_table="bad;table")]))
+    assert any("not a valid SQL identifier" in e for e in errors)
+
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _enrich_step("e", db_type="oracle")]))
+    assert any("unsupported db_type" in e for e in errors)
+
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _enrich_step("e", db_type="postgresql")]))
+    assert any("connection_string is required" in e for e in errors)
+
+    errors = r.validate_channel_definition(_valid(pipeline=[
+        _enrich_step("e", fields=[])]))
+    assert any("fields" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# shared step CRUD (immutable versions)
+# ---------------------------------------------------------------------------
+
+
+def test_save_shared_step_immutable_versions(tmp_path):
+    r = _registry(tmp_path)
+    v1 = r.save_shared_step("mapping", "m", {"rules": []})
+    assert v1 == 1
+    with pytest.raises(ConfigValidationError, match="immutable"):
+        r.save_shared_step("mapping", "m", {"rules": []}, version=v1)
+    v2 = r.save_shared_step("mapping", "m", {
+        "rules": [{"source": "patient.name", "target": "patient.name"}]})
+    assert v2 == v1 + 1
+    listed = [s for s in r.list_shared_steps("mapping") if s["id"] == "m"]
+    assert [s["version"] for s in listed] == [1, 2]
+
+
+def test_save_shared_step_validates_config(tmp_path):
+    r = _registry(tmp_path)
+    with pytest.raises(ConfigValidationError, match="unknown transform fn"):
+        r.save_shared_step("mapping", "bad", {
+            "rules": [{"source": "patient.name", "target": "patient.name",
+                       "fn": "NotExist"}]})
+    with pytest.raises(ConfigValidationError, match="unknown shared step kind"):
+        r.save_shared_step("sprocket", "x", {})
+
+
+def test_save_shared_filter_with_discard_on_fail(tmp_path):
+    r = _registry(tmp_path)
+    v = r.save_shared_step("filter", "drop_empty", {
+        "expression": {"missing": [{"var": ["patient.name"]}]},
+        "on_fail": "discard"})
+    listed = r.list_shared_steps("filter")
+    assert {"kind": "filter", "id": "drop_empty", "version": v,
+            "description": ""} in listed
+
+
+# ---------------------------------------------------------------------------
+# channel save/load with resolved pipeline
+# ---------------------------------------------------------------------------
+
+
 def test_channel_saved_and_loaded_with_resolved_refs(tmp_path):
     r = _registry(tmp_path)
-    v = r.save_mapping("m1", [{"source": "patient.name", "target": "patient.name"}])
-    r.save_channel_definition(_valid(mapping_id="m1", mapping_version=v))
+    v = r.save_shared_step("mapping", "m1", {
+        "rules": [{"source": "patient.name", "target": "patient.name"}]})
+    r.save_channel_definition(_valid(pipeline=[
+        {"step_id": "s1", "type": "transform",
+         "shared": {"kind": "mapping", "id": "m1", "version": v}}]))
     cfg = r.load_all_configs()["c1"]
-    assert cfg["mapping_rules"] == [{"source": "patient.name", "target": "patient.name"}]
+    step = cfg["pipeline"][0]
+    assert step["config"]["rules"] == [{"source": "patient.name", "target": "patient.name"}]
+    assert step["shared_ref"] == {"kind": "mapping", "id": "m1", "version": v}
     assert cfg["retry_policy"] == {"max_retries": 3, "base_backoff_seconds": 2}
     assert cfg["inbound_codec"] == "json"
 
 
-def test_shared_mapping_across_channels(tmp_path):
+def test_shared_transform_across_channels(tmp_path):
     r = _registry(tmp_path)
     rules = [{"source": "patient.name", "target": "patient.name", "fn": "Uppercase"}]
-    v = r.save_mapping("shared_map", rules)
-    r.save_channel_definition(_valid("a1", mapping_id="shared_map", mapping_version=v))
-    r.save_channel_definition(_valid("a2", mapping_id="shared_map", mapping_version=v))
+    v = r.save_shared_step("mapping", "shared_map", {"rules": rules})
+    shared = {"kind": "mapping", "id": "shared_map", "version": v}
+    r.save_channel_definition(_valid("a1", pipeline=[
+        {"step_id": "s1", "type": "transform", "shared": shared}]))
+    r.save_channel_definition(_valid("a2", pipeline=[
+        {"step_id": "s2", "type": "transform", "shared": shared}]))
     cfg = r.load_all_configs()
-    assert cfg["a1"]["mapping_rules"] == rules
-    assert cfg["a2"]["mapping_rules"] == rules
+    assert cfg["a1"]["pipeline"][0]["config"]["rules"] == rules
+    assert cfg["a2"]["pipeline"][0]["config"]["rules"] == rules
 
 
-def test_mapping_versioning_isolates_consumers(tmp_path):
+def test_shared_step_versioning_isolates_consumers(tmp_path):
     r = _registry(tmp_path)
-    v1 = r.save_mapping("m2", [{"source": "a", "target": "a"}])
-    r.save_channel_definition(_valid("b1", mapping_id="m2", mapping_version=v1))
+    v1 = r.save_shared_step("mapping", "m2", {
+        "rules": [{"source": "patient.name", "target": "patient.name"}]})
+    r.save_channel_definition(_valid("b1", pipeline=[
+        {"step_id": "s1", "type": "transform",
+         "shared": {"kind": "mapping", "id": "m2", "version": v1}}]))
 
-    v2 = r.save_mapping("m2", [{"source": "changed", "target": "changed"}])
+    v2 = r.save_shared_step("mapping", "m2", {
+        "rules": [{"source": "patient.dob", "target": "patient.dob"}]})
     assert v2 > v1
     cfg = r.load_all_configs()
-    assert cfg["b1"]["mapping_rules"] == [{"source": "a", "target": "a"}]  # pinned consumer unaffected
+    # pinned consumer unaffected by the new version
+    assert cfg["b1"]["pipeline"][0]["config"]["rules"] == [
+        {"source": "patient.name", "target": "patient.name"}]
 
-    r.save_channel_definition(_valid("b2", mapping_id="m2", mapping_version=v2))
-    assert r.load_all_configs()["b2"]["mapping_rules"] == [{"source": "changed", "target": "changed"}]
+    r.save_channel_definition(_valid("b2", pipeline=[
+        {"step_id": "s2", "type": "transform",
+         "shared": {"kind": "mapping", "id": "m2", "version": v2}}]))
+    assert r.load_all_configs()["b2"]["pipeline"][0]["config"]["rules"] == [
+        {"source": "patient.dob", "target": "patient.dob"}]
 
 
 def test_shared_enrichment_referenced_by_multiple_channels(tmp_path):
     r = _registry(tmp_path)
-    v = r.save_enrichment(
-        "pt_lookup", source_key_field="patient.identifiers.0.value",
-        lookup_db_path=str(tmp_path / "ref.db"), target_table="patients",
-        target_key_col="mrn", fields=["name"], lookup_name="pt",
-    )
-    r.save_channel_definition(_valid("x1", enrichment_id="pt_lookup", enrichment_version=v))
-    r.save_channel_definition(_valid("x2", enrichment_id="pt_lookup", enrichment_version=v))
+    v = r.save_shared_step("enrichment", "pt_lookup", {
+        "source_key_field": "patient.identifiers.0.value",
+        "lookup_db_path": str(tmp_path / "ref.db"),
+        "target_table": "patients", "target_key_col": "mrn",
+        "fields": ["name"], "lookup_name": "pt",
+    })
+    shared = {"kind": "enrichment", "id": "pt_lookup", "version": v}
+    r.save_channel_definition(_valid("x1", pipeline=[
+        {"step_id": "s1", "type": "enrich", "shared": shared}]))
+    r.save_channel_definition(_valid("x2", pipeline=[
+        {"step_id": "s2", "type": "enrich", "shared": shared}]))
     cfg = r.load_all_configs()
-    assert cfg["x1"]["enrichment"]["source_key_field"] == "patient.identifiers.0.value"
-    assert cfg["x2"]["enrichment"]["lookup_name"] == "pt"
+    assert cfg["x1"]["pipeline"][0]["config"]["source_key_field"] == "patient.identifiers.0.value"
+    assert cfg["x2"]["pipeline"][0]["config"]["lookup_name"] == "pt"
+
+
+def test_inline_step_versions_bump_under_stable_step_id(tmp_path):
+    r = _registry(tmp_path)
+    r.save_channel_definition(_valid("v1", pipeline=[
+        _transform_step("stable", [{"source": "patient.name", "target": "patient.name"}])]))
+    r.save_channel_definition(_valid("v1", pipeline=[
+        _transform_step("stable", [{"source": "patient.dob", "target": "patient.dob"}])]))
+    with r._get_conn() as conn:
+        rows = conn.execute(
+            "SELECT version, config FROM pipeline_steps WHERE step_id = ? ORDER BY version",
+            ("stable",)).fetchall()
+    assert [row["version"] for row in rows] == [1, 2]
+    assert json.loads(rows[0]["config"])["rules"][0]["source"] == "patient.name"
+    assert json.loads(rows[1]["config"])["rules"][0]["source"] == "patient.dob"
+
+
+def test_shared_step_snapshot_records_provenance(tmp_path):
+    r = _registry(tmp_path)
+    v = r.save_shared_step("mapping", "prov", {
+        "rules": [{"source": "patient.name", "target": "patient.name"}]})
+    r.save_channel_definition(_valid("p1", pipeline=[
+        {"step_id": "s1", "type": "transform",
+         "shared": {"kind": "mapping", "id": "prov", "version": v}}]))
+    with r._get_conn() as conn:
+        row = conn.execute(
+            "SELECT config, provenance FROM pipeline_steps WHERE step_id = 's1'").fetchone()
+    assert json.loads(row["config"])["rules"] == [
+        {"source": "patient.name", "target": "patient.name"}]
+    assert json.loads(row["provenance"]) == {
+        "kind": "mapping", "id": "prov", "version": v}
+
+
+# ---------------------------------------------------------------------------
+# build_runner (declarative end-to-end)
+# ---------------------------------------------------------------------------
 
 
 def test_build_runner_executes_declarative_channel(tmp_path):
@@ -147,8 +455,8 @@ def test_build_runner_executes_declarative_channel(tmp_path):
     q = PersistentQueue(str(tmp_path / "q.db"))
     rec = RecordingDestination()
 
-    v = r.save_mapping("rename", [{"source": "patient.name", "target": "patient.name", "fn": "Uppercase"}])
-    r.save_channel_definition(_valid("e2e", mapping_id="rename", mapping_version=v))
+    r.save_channel_definition(_valid("e2e", pipeline=[_transform_step("t1", [
+        {"source": "patient.name", "target": "patient.name", "fn": "Uppercase"}])]))
 
     runner = r.build_runner("e2e", q, destination=rec)
     assert isinstance(runner, ChannelRunner)
@@ -195,6 +503,7 @@ def test_field_mapper_canonical_paths():
     assert out["extensions"]["mrn"] == "42"
     assert out["patient"]["identifiers"][0]["value"] == "42"  # untouched deep field preserved
 
+
 def test_enrichment_on_canonical_via_runner(tmp_path):
     import sqlite3
     ref_db = str(tmp_path / "ref.db")
@@ -206,26 +515,8 @@ def test_enrichment_on_canonical_via_runner(tmp_path):
     q = PersistentQueue(str(tmp_path / "q3.db"))
     rec = RecordingDestination()
 
-    ev = r.save_enrichment(
-        "pt_lookup", source_key_field="patient.identifiers.0.value",
-        lookup_db_path=ref_db, target_table="patients", target_key_col="mrn",
-        fields=["name"], lookup_name="pt",
-    )
-    mv = r.save_mapping(
-        "use_lookup", [{"source": "lookups.pt.name", "target": "extensions.patient_name"}]
-    )
-    r.save_channel_definition(_valid(
-        "enr", enrichment_id="pt_lookup", enrichment_version=ev,
-        mapping_id="use_lookup", mapping_version=mv,
-    ))
-
-    runner = r.build_runner("enr", q, destination=rec)
-    env = Envelope(channel_id="enr", raw='{"patient": {"identifiers": [{"value": "42"}]}}', inbound_codec="json")
-    q.enqueue(env)
-    assert runner.process_one() is True
-
-    sent = json.loads(rec.sent[0])
-    # enrichment resolved the canonical identifier and the mapper pulled from
-    # the attached lookup value
-    assert sent["extensions"]["patient_name"] == "Grace Hopper"
-
+    r.save_channel_definition(_valid("enr", pipeline=[
+        _enrich_step("e1", lookup_db_path=ref_db),
+        _transform_step("t1", [
+            {"source": "lookups.pt.name", "target": "extensions.patient_name"}]),
+    ]))
