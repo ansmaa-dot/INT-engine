@@ -23,6 +23,15 @@ class Codec(ABC):
 
     key: str = ""
 
+    #: Wire-format shape contract. ``"structured"`` codecs (HL7/FHIR/canonical
+    #: JSON) have a fixed schema their ``parse()`` resolves into a nested tree
+    #: by format rules. ``"schemaless"`` codecs (db_poller/http_json/webhook raw
+    #: JSON) accept dynamic payloads and must normalize the shape inside
+    #: ``parse()`` (e.g. unflatten dot-notation keys) before validating into the
+    #: canonical model. Stored on the registry for config-time transport↔codec
+    #: shape guidance; it is metadata, never a behavior fork by itself.
+    structure: str = "structured"
+
     @abstractmethod
     def parse(
         self, raw: str | bytes, metadata: WireContext | None = None

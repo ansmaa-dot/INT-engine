@@ -46,7 +46,7 @@ from engine.steps import (
     Step,
     build_step,
 )
-from nodes.codec import keys as codec_keys
+from nodes.codec import CodecNotFoundError, keys as codec_keys, structure as codec_structure
 from nodes.destination.http_client import HttpClientNode
 from nodes.destination.mllp_client import MllpClientNode
 from nodes.destination.sftp_client import SFTPClientNode
@@ -66,6 +66,12 @@ from nodes.transform.functions import REGISTRY as TRANSFORM_FN_REGISTRY
 # one is one entry here plus one builder branch below.
 TRANSPORTS = {"http_webhook", "mllp", "http_poller", "file_watcher", "db_poller"}
 DESTINATIONS = {"http", "mllp", "sftp"}
+
+# Transport shape classes (paired with ``Codec.structure``): schemaless
+# transports deliver dynamic/flat payloads (rows, arbitrary JSON), structured
+# transports deliver wire text with an implicit fixed format.
+SCHEMALESS_TRANSPORTS = ("http_webhook", "http_poller", "db_poller")
+STRUCTURED_TRANSPORTS = ("mllp", "file_watcher")
 
 # Schema stamp (PRAGMA user_version). Bump = hard reset, not a migration.
 SCHEMA_VERSION = 1
@@ -93,9 +99,44 @@ def _json_text(obj) -> str | None:
 
 
 def _valid_source_path(path: str) -> bool:
-    """Rule sources may be canonical paths or ``lookups.*`` (the runtime
-    enrichment namespace, which cannot be statically known)."""
-    return path.startswith("lookups.") or validate_canonical_path(path)
+    """Rule sources may be canonical paths, ``lookups.*`` (the runtime
+    enrichment namespace, not statically known), or ``extensions.*`` (inbound
+    data preserved under the escape hatch by schemaless codecs)."""
+    return (
+        path.startswith("lookups.")
+        or path.startswith("extensions.")
+        or validate_canonical_path(path)
+    )
+
+
+def codec_shape_hint(transport: str, inbound_codec: str) -> str | None:
+    """Advisory (never fatal) guidance for a transport↔inbound-codec pairing.
+
+    A schemaless transport (webhook / http_poller / db_poller) feeding a
+    structured codec (hl7v2.* / fhir.r4 / canonical json) will silently drop
+    flat rows, so suggest ``schemaless.json``; a structured transport
+    (mllp / file_watcher) feeding a schemaless codec is usually a mistake.
+    Unknown/empty inputs return ``None`` (unknown codecs are hard-failed
+    elsewhere by ``validate_channel_definition``).
+    """
+    if not transport or not inbound_codec:
+        return None
+    try:
+        shape = codec_structure(inbound_codec)
+    except CodecNotFoundError:
+        return None
+    if transport in SCHEMALESS_TRANSPORTS and shape == "structured":
+        return (
+            f"'{transport}' delivers schemaless payloads; '{inbound_codec}' "
+            "expects a fixed structure. For flat / dot-notation rows use "
+            "'schemaless.json'."
+        )
+    if transport in STRUCTURED_TRANSPORTS and shape == "schemaless":
+        return (
+            f"'{transport}' delivers raw wire text; 'schemaless.json' expects "
+            "a JSON object — prefer a structured inbound codec for it."
+        )
+    return None
 
 
 def _valid_target_path(path: str) -> bool:
@@ -561,6 +602,16 @@ class ChannelConfigRegistry:
             errors.append("sftp destination requires destination_config.host")
 
         return errors
+
+    def channel_shape_hints(self, definition: dict) -> list[str]:
+        """Non-fatal advisory hints for a channel definition (transport vs
+        inbound-codec shape). Separate from ``validate_channel_definition``'s
+        hard errors so the API/UI can surface them without blocking saves."""
+        hint = codec_shape_hint(
+            definition.get("inbound_transport") or "",
+            definition.get("inbound_codec") or "",
+        )
+        return [hint] if hint else []
 
     def _validate_pipeline_entry(self, index: int, entry, seen_ids: set) -> list[str]:
         label = f"pipeline[{index}]"

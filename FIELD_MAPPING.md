@@ -153,6 +153,42 @@ JSON keys **are** the canonical field names — there is no per-field translatio
 This is the format you see in `envelope.canonical_dict` and the format a mapper
 reads/writes.
 
+### 3.1 Schemaless inbound — flat dot-notation and dynamic payloads
+
+Webhook / HTTP-poll / DB-row sources rarely emit canonical-shaped JSON. The
+**`schemaless.json`** inbound codec
+(`nodes/codec/rawjson.py`, default for `http_webhook` / `http_poller` /
+`db_poller` channels) handles arbitrary payloads:
+
+```json
+// a db_poller row becomes (flat, dot-notation keys)
+{
+  "patient.name": "John",
+  "patient.identifiers.0.value": "123",
+  "patient.identifiers.0.system": "urn:mrn",
+  "patient.dob": "1970-06-15",
+  "mrn": "12345",
+  "doctor_note": "urgent"
+}
+```
+
+Its `parse()` pipeline: unflatten flat keys into nested dicts/lists, project
+the canonical top-level groups into the model, and preserve **every other
+inbound key under `extensions.<path>`**:
+
+```json
+{
+  "patient": { "name": "John", "dob": "1970-06-15",
+               "identifiers": [ { "value": "123", "system": "urn:mrn" } ] },
+  "extensions": { "mrn": "12345", "doctor_note": "urgent" }
+}
+```
+
+So you can map any raw column/webhook field by reading it under `extensions.*`
+(§7), while canonical leaves feed HL7/FHIR outbound directly. Nothing is
+silently dropped — unlike the strict `json` codec, which discounts unknown or
+flat keys (that is what used to leave `patient` null and outbound PID empty).
+
 ---
 
 ## 4. HL7 v2 (ORU_R01 / ADT_A01 / ORM_O01) mapping
@@ -257,15 +293,16 @@ Rules are stored as JSON in the `mappings` table (columns `rules`, pinned to a
 
 ```json
 {
-  "source":   "<canonical path | lookups.<name>.<field>>",
-  "target":   "<canonical path>",
+  "source":   "<canonical path | lookups.<name>.<field> | extensions.<path>>",
+  "target":   "<canonical path | extensions.<path>>",
   "required":  false,
   "fn":        "Uppercase | Lowercase | Trim Whitespace | Format | Default",
   "fn_args":   { }
 }
 ```
 
-- `source` is read from the canonical form (or from enrichment `lookups`).
+- `source` is read from the canonical form, from enrichment `lookups`, or from
+  `extensions.<path>` (inbound data preserved by `schemaless.json`).
 - `target` is written back into a copy of the canonical form; untouched fields
   survive, and the whole result is re-validated as a `CanonicalMessage`.
 - `required: true` raises if the source is missing.

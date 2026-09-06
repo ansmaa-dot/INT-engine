@@ -21,7 +21,7 @@ class DBPoller(IngestionNode):
                  cursor_param: str | None = None,
                  max_queue_depth: int | None = None,
                  idempotency_key_field: str | None = None,
-                 inbound_codec: str = "json"):
+                 inbound_codec: str = "schemaless.json"):
         if interval_s < 5:
             raise ValueError("interval_s must be >= 5")
         self.connection_string = connection_string

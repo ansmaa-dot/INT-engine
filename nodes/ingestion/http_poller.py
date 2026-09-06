@@ -28,7 +28,7 @@ class HTTPPoller(IngestionNode):
                  records_path: str = "", cursor_param: str | None = None,
                  cursor_field: str | None = None, max_queue_depth: int | None = None,
                  idempotency_key_field: str | None = None,
-                 inbound_codec: str = "json"):
+                 inbound_codec: str = "schemaless.json"):
         if interval_s < 5:
             raise ValueError("interval_s must be >= 5")
         self.url = url

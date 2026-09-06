@@ -9,11 +9,19 @@ from nodes.codec.json import JsonCodec
 from nodes.codec.passthrough import PassthroughCodec
 from nodes.codec.hl7v2.codec import Hl7V2Codec
 from nodes.codec.fhir.codec import FhirR4Codec
-from nodes.codec.registry import CodecNotFoundError, get, keys, register
+from nodes.codec.rawjson import SchemalessJsonCodec
+from nodes.codec.registry import (
+    CodecNotFoundError,
+    get,
+    keys,
+    register,
+    structure,
+)
 
 # Register built-in codecs on import (all registration is explicit).
 register(JsonCodec())
 register(PassthroughCodec())
+register(SchemalessJsonCodec())
 register(Hl7V2Codec(profile="ORU_R01", key="hl7v2.5.1.ORU_R01"))
 register(Hl7V2Codec(profile="ADT_A01", key="hl7v2.5.1.ADT_A01"))
 register(Hl7V2Codec(profile="ORM_O01", key="hl7v2.5.1.ORM_O01"))
@@ -27,7 +35,9 @@ __all__ = [
     "Hl7V2Codec",
     "JsonCodec",
     "PassthroughCodec",
+    "SchemalessJsonCodec",
     "get",
     "keys",
     "register",
+    "structure",
 ]

@@ -41,3 +41,13 @@ def get(key: str) -> Codec:
 def keys() -> list[str]:
     """All currently registered codec keys, sorted."""
     return sorted(REGISTRY)
+
+
+def structure(key: str) -> str:
+    """Return the wire-shape class of the codec under ``key``
+    (``\"structured\"`` or ``\"schemaless\"``).
+
+    Raises ``CodecNotFoundError`` for any unknown key — same contract as
+    ``get()``.
+    """
+    return get(key).structure

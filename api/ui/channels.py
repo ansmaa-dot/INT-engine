@@ -304,13 +304,14 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
     from api.ui.helpers import codec_label
     from core.field_catalog import catalog_for_codec
     from api.ui.fields import STEP_TYPE_META
+    from nodes.transform.functions import REGISTRY as TRANSFORM_FN_REGISTRY
 
     if config is None:
         config = {
             "channel_id": "", "name": "", "enabled": True, "status": "running",
             "concurrency": 1,
             "inbound_transport": "http_webhook", "inbound_transport_config": {},
-            "inbound_codec": "json", "outbound_codec": "json",
+            "inbound_codec": "schemaless.json", "outbound_codec": "json",
             "destination": "http", "destination_config": {"endpoint_url": ""},
             "retry_policy_id": "default", "pipeline": [],
         }
@@ -331,6 +332,16 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
               for k in codec_opts]
     outbound_codecs = [{"value": k, "label": codec_label(k), "selected": k == selected_out_codec}
                        for k in codec_opts]
+
+    # Advisory (non-fatal) guidance when the selected transport and inbound
+    # codec disagree about payload shape (e.g. a webhook plus the strict JSON
+    # codec will silently drop flat dot-notation rows).
+    from engine.config_loader import codec_shape_hint
+    shape_hint = codec_shape_hint(selected_transport, selected_codec)
+
+    # Whitelisted transform functions exposed on each Map rule so the UI stays
+    # in sync with the backend registry (nodes/transform/functions.py).
+    transform_fns = sorted(TRANSFORM_FN_REGISTRY)
 
     destinations = [{"value": d, "label": _DEST_LABELS.get(d, d),
                      "selected": d == selected_dest}
@@ -408,7 +419,9 @@ def _render_channel_form(config=None, flash_errors=None, flash_success=None, ini
         flash_success=flash_success,
         initial_step=initial_step,
         field_catalog=field_catalog,
+        codec_shape_hint=shape_hint,
         step_type_meta=STEP_TYPE_META,
+        transform_fns=transform_fns,
         pipeline_json=pipeline_json,
     )
 

@@ -15,7 +15,8 @@ bp = Blueprint("api_routes", __name__)
 def validate_config():
     data = request.get_json(silent=True) or {}
     errors = registry.validate_channel_definition(data)
-    return jsonify({"valid": len(errors) == 0, "errors": errors})
+    hints = registry.channel_shape_hints(data)
+    return jsonify({"valid": len(errors) == 0, "errors": errors, "hints": hints})
 
 
 @bp.route("/api/ingest/<channel_id>", methods=["POST"])

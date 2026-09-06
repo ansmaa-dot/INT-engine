@@ -142,6 +142,9 @@
           </select>
         </label>
       </div>
+      {% if codec_shape_hint %}
+      <p class="cf-hint" style="color:var(--status-yellow);margin-top:6px;">⚠ {{ codec_shape_hint }}</p>
+      {% endif %}
     </fieldset>
 
     <fieldset class="cf-section">
@@ -328,9 +331,53 @@ if (initStep > 0 && initStep < total) { current = initStep; }
 
 /* ---- Step-chain Engine ---- */
 var STEP_TYPES = {{ step_type_meta|tojson }};
+var TRANSFORM_FNS = {{ transform_fns|tojson }};
 var pipeline = [];
 var stepIdCounter = 0;
 function nextStepId(type){ stepIdCounter++; return 's' + stepIdCounter + '_' + type; }
+
+/* Escape a value for embedding into an HTML attribute (rule source/target,
+   function args) so user-supplied config can never break out of the markup. */
+function escAttr(s){
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+/* Build the whitelisted-function <select> for one Map rule.
+   '' = "none" -> the rule does a plain source->target copy. */
+function fnSelectHtml(selected){
+  var opts = ['<option value="">(none)</option>'];
+  (TRANSFORM_FNS || []).forEach(function(fn){
+    opts.push('<option value="' + fn + '"' + (selected === fn ? ' selected' : '') + '>' + fn + '</option>');
+  });
+  return '<select class="cf-input rule-fn" onchange="Engine.ruleFnChanged(this)" style="min-width:150px;">' + opts.join('') + '</select>';
+}
+/* Render the per-function Args control for one Map rule.
+   Format -> free-text strftime format; Default -> free-text fallback value;
+   other functions -> no args (dash). Anything previously saved that doesn't
+   fit those two falls back to a generic JSON box so nothing is dropped. */
+function fnArgsCellHtml(rule){
+  var fn = rule && rule.fn ? rule.fn : '';
+  var args = rule ? rule.fn_args : undefined;
+  var parsedObj = null, rawStr = null;
+  if(typeof args === 'object' && args !== null && !Array.isArray(args)) parsedObj = args;
+  else if(typeof args === 'string'){
+    rawStr = args;
+    try{ var p = JSON.parse(args); if(p && typeof p === 'object' && !Array.isArray(p)) parsedObj = p; }catch(e){}
+  }
+  var style = 'style="min-width:170px;"';
+  if(fn === 'Format'){
+    var fmt = (parsedObj && parsedObj.fmt != null) ? String(parsedObj.fmt) : '';
+    return '<input class="cf-input rule-arg-value" value="' + escAttr(fmt) + '" placeholder="%Y%m%d%H%M%S" ' + style + ' title="strftime output format (default %Y%m%d%H%M%S)" onchange="Engine.stepChanged()">';
+  }
+  if(fn === 'Default'){
+    var dv = (parsedObj && parsedObj.default != null) ? String(parsedObj.default) : '';
+    return '<input class="cf-input rule-arg-value" value="' + escAttr(dv) + '" placeholder="value when source missing" ' + style + ' title="Fallback value used when the source field is empty or missing" onchange="Engine.stepChanged()">';
+  }
+  if(parsedObj || rawStr){
+    var val = parsedObj ? JSON.stringify(parsedObj) : rawStr;
+    return '<input class="cf-input rule-arg-raw" value="' + escAttr(val) + '" placeholder="{}" ' + style + ' onchange="Engine.stepChanged()">';
+  }
+  return '<span class="cf-hint" style="padding:4px 2px;display:inline-block;">—</span>';
+}
 
 function assemblePipeline(){
   var arr = [];
@@ -394,7 +441,26 @@ function readStepConfig(card, step){
     rcs.forEach(function(rc){
       var src = (rc.querySelector('.rule-source')||{}).value || '';
       var tgt = (rc.querySelector('.rule-target')||{}).value || '';
-      if(src || tgt) step.rules.push({source: src, target: tgt});
+      var fnName = ((rc.querySelector('.rule-fn')||{}).value || '').trim();
+      var rule = {source: src, target: tgt};
+      if(fnName) rule.fn = fnName;
+      var argInput = rc.querySelector('.rule-arg-value, .rule-arg-raw');
+      if(argInput){
+        var val = argInput.value.trim();
+        if(val){
+          // Friendly builders: Format takes a format string, Default a value.
+          if(fnName === 'Format') rule.fn_args = {fmt: val};
+          else if(fnName === 'Default') rule.fn_args = {default: val};
+          else {
+            // Fallback path: existing rules with arbitrary JSON args.
+            var parsed = null;
+            try { parsed = JSON.parse(val); } catch(err) { parsed = null; }
+            if(parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rule.fn_args = parsed;
+            else rule.fn_args = val;
+          }
+        }
+      }
+      if(src || tgt || fnName) step.rules.push(rule);
     });
   } else if(st === 'enrich'){
     step.db_type = (card.querySelector('.enrich-db-type')||{}).value || 'sqlite';
@@ -473,7 +539,16 @@ window.Engine = {
       document.getElementById(menuId).classList.toggle('open');
     },
     closeMenu: function(menuId){ document.getElementById(menuId).classList.remove('open'); },
-    toggleCard: function(headEl){ headEl.closest('.step-card').classList.toggle('open'); }
+    toggleCard: function(headEl){ headEl.closest('.step-card').classList.toggle('open'); },
+    /* Re-render a rule's Args cell when its Function dropdown changes. */
+    ruleFnChanged: function(sel){
+      var tr = sel.closest ? sel.closest('tr') : null;
+      if(tr){
+        var cell = tr.querySelector('.rule-args-cell');
+        if(cell) cell.innerHTML = fnArgsCellHtml({fn: sel.value});
+      }
+      assemblePipeline();
+    }
   },
   stepChanged: function(){ assemblePipeline(); }
 };
@@ -501,7 +576,7 @@ if(stepChain){
         var tbody = table.querySelector('tbody');
         var tr = document.createElement('tr');
         tr.className = 'mapping-rule';
-        tr.innerHTML = '<td><input class="cf-input rule-source" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td class="mt-arrow">&rarr;</td><td><input class="cf-input rule-target" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td><button type="button" class="mt-remove" data-action="remove-rule">&times;</button></td>';
+        tr.innerHTML = '<td><input class="cf-input rule-source" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td class="mt-arrow">&rarr;</td><td><input class="cf-input rule-target" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td>' + fnSelectHtml('') + '</td><td class="rule-args-cell">' + fnArgsCellHtml({}) + '</td><td><button type="button" class="mt-remove" data-action="remove-rule">&times;</button></td>';
         tbody.appendChild(tr);
         Engine.stepChanged();
       }
@@ -554,9 +629,9 @@ function makeStepCardHTML(step, idx){
   var body = '';
 
   if(step.type === 'transform'){
-    body = '<table class="mapping-table"><thead><tr><th>Source Field</th><th></th><th>Target Field</th><th></th></tr></thead><tbody>';
+    body = '<table class="mapping-table"><thead><tr><th>Source Field</th><th></th><th>Target Field</th><th>Function</th><th>Args</th><th></th></tr></thead><tbody>';
     (step.rules||[]).forEach(function(rule){
-      body += '<tr class="mapping-rule"><td><input class="cf-input rule-source" value="' + (rule.source||'') + '" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td class="mt-arrow">&rarr;</td><td><input class="cf-input rule-target" value="' + (rule.target||'') + '" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td><button type="button" class="mt-remove" data-action="remove-rule">&times;</button></td></tr>';
+      body += '<tr class="mapping-rule"><td><input class="cf-input rule-source" value="' + escAttr(rule.source) + '" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td class="mt-arrow">&rarr;</td><td><input class="cf-input rule-target" value="' + escAttr(rule.target) + '" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td>' + fnSelectHtml(rule.fn||'') + '</td><td class="rule-args-cell">' + fnArgsCellHtml(rule) + '</td><td><button type="button" class="mt-remove" data-action="remove-rule">&times;</button></td></tr>';
     });
     body += '</tbody></table>';
     body += '<div class="mt-add-row" data-action="add-rule">+ Add Mapping Rule</div>';

@@ -27,7 +27,7 @@ class WebhookRegistry:
     def register(self, channel_id: str, shared_secret: str | None = None,
                  sig_header: str = "X-Signature", max_queue_depth: int | None = None,
                  idempotency_key_field: str | None = None,
-                 inbound_codec: str = "json"):
+                 inbound_codec: str = "schemaless.json"):
         self._channels[channel_id] = {
             "secret": shared_secret,
             "sig_header": sig_header,

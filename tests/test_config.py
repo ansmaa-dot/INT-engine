@@ -504,6 +504,42 @@ def test_field_mapper_canonical_paths():
     assert out["patient"]["identifiers"][0]["value"] == "42"  # untouched deep field preserved
 
 
+def test_extensions_paths_accepted_as_rule_source(tmp_path):
+    """Schemaless inbound data is preserved under ``extensions.*``; map rules
+    must be allowed to read it even though it is not a static catalog leaf."""
+    r = _registry(tmp_path)
+    d = _valid("extsrc", pipeline=[
+        _transform_step("t1", [
+            {"source": "extensions.vendor.flag", "target": "patient.name"},
+        ]),
+    ])
+    assert r.validate_channel_definition(d) == []
+
+    d_enrich = _valid(
+        "enrichsrc",
+        pipeline=[_enrich_step("e1", source_key_field="extensions.mrn")],
+    )
+    assert r.validate_channel_definition(d_enrich) == []
+
+
+def test_shape_hint_non_fatal_for_schemaless_transport(tmp_path):
+    """transport↔codec shape mismatch is advisory: valid channel, plus a hint."""
+    r = _registry(tmp_path)
+    d = _valid(inbound_transport="db_poller",
+               inbound_transport_config={"connection_string": "sqlite:///x.db",
+                                         "query": "SELECT 1"},
+               inbound_codec="hl7v2.5.1.ORU_R01")
+    # Schemaless transport + structured codec is structurally VALID...
+    assert r.validate_channel_definition(d) == []
+    # ...but produces a non-fatal advisory hint.
+    hints = r.channel_shape_hints(d)
+    assert len(hints) == 1
+    assert "schemaless.json" in hints[0]
+
+    coherent = _valid(inbound_codec="schemaless.json")
+    assert r.channel_shape_hints(coherent) == []
+
+
 def test_enrichment_on_canonical_via_runner(tmp_path):
     import sqlite3
     ref_db = str(tmp_path / "ref.db")

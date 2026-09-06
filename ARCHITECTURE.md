@@ -80,7 +80,7 @@ nodes/
     base.py                   # Codec ABC (parse / serialize)
     registry.py               # exact-key codec registry (no implicit fallback)
     __init__.py               # registers all built-in codecs
-    json.py / passthrough.py
+    json.py / rawjson.py / passthrough.py
     hl7v2/{codec,parser,serializer,er7}.py
     fhir/codec.py
   ingestion/   http_webhook, mllp_server, http_poller, file_watcher, db_poller
@@ -159,6 +159,11 @@ Design rules enforced by the codecs:
 (integer segments index lists) but there is **no `raw.*` business namespace**:
 raw wire content is available only for audit/replay/debugging, never as the
 transformation interface.
+
+`unflatten_dot_keys(payload)` folds flat dot-notation keys back into the
+nested tree — the shape-normalization primitive for **schemaless** inbound
+(see §7.3): `{"patient.name": "Ada", "patient.identifiers.0.value": "42"}`
+→ `{"patient": {"name": "Ada", "identifiers": [{"value": "42"}]}}`.
 
 ### 5.3 Envelope and message state
 
@@ -242,13 +247,14 @@ and written to the queue row + `audit_log`.
   implicit passthrough fallback**.
 - All built-in codecs are registered by `nodes/codec/__init__.py`:
 
-| key | format |
-|---|---|
-| `json` | JSON ↔ canonical |
-| `passthrough` | raw text preserved verbatim in `extensions._passthrough_raw` |
-| `hl7v2.5.1.ORU_R01` | HL7 v2.5.1 results messages |
-| `hl7v2.5.1.ADT_A01` | HL7 v2.5.1 admit/discharge messages |
-| `fhir.r4` | FHIR R4 JSON Bundle |
+| key | format | structure |
+|---|---|---|
+| `json` | JSON ↔ canonical (strict, canonical keys only) | structured |
+| `schemaless.json` | arbitrary JSON incl. flat dot-notation (`rawjson.py`) | schemaless |
+| `passthrough` | raw text preserved verbatim in `extensions._passthrough_raw` | structured |
+| `hl7v2.5.1.ORU_R01` | HL7 v2.5.1 results messages | structured |
+| `hl7v2.5.1.ADT_A01` | HL7 v2.5.1 admit/discharge messages | structured |
+| `fhir.r4` | FHIR R4 JSON Bundle | structured |
 
 ### 7.2 JSON (`nodes/codec/json.py`)
 
@@ -258,12 +264,43 @@ and written to the queue row + `audit_log`.
 - `serialize`: `model_dump(mode="json")` with `sort_keys=True` so re-parsing
   yields an equal canonical message.
 
-### 7.3 Passthrough (`nodes/codec/passthrough.py`)
+Because Pydantic ignores extra keys by default, the strict `json` codec also
+*ignores* flat dot-notation keys — `{"patient.name": "John"}` decodes and
+validates with `patient=None`, so an outbound HL7 PID silently builds from
+nothing. Use `schemaless.json` for that shape (below).
+
+### 7.3 Schemaless / raw JSON (`nodes/codec/rawjson.py`)
+
+For **schemaless inbound transports** (`db_poller`, `http_webhook`,
+`http_poller`) whose raw JSON has no fixed schema — including flat
+dot-notation rows like `{"patient.name": "John", "patient.identifiers.0.value":
+"123"}`. This codec is the shape-normalization boundary:
+
+1. bytes → `json.loads` (same `json.*` error taxonomy).
+2. `unflatten_dot_keys()` folds flat dotted keys into nested dicts/lists
+   (via the same `assign_path` used by the mapper).
+3. Canonical top-level groups (`patient`, `encounter`, `order`, `specimen`,
+   `observations`, `metadata`, `schema_version`, `extensions`) validate into
+   the model; **any other inbound key is preserved under `extensions.<path>`**
+   — nothing is silently dropped.
+4. `CanonicalMessage.model_validate`.
+
+`serialize` emits the normalized canonical JSON (identical to `json`), so
+round-tripping a schemaless channel is lossless. Missing transport provenance
+is filled from `WireContext` when the payload carries no `metadata` block.
+
+A channel using `schemaless.json` plus dataless sources still gets a *valid*
+(empty) canonical message; the config layer surfaces a **non-fatal advisory
+hint** (`ChannelConfigRegistry.channel_shape_hints`, UI: yellow note beside the
+codec select, API: `hints` array in `/api/config/validate`) when a schemaless
+transport is paired with a structured codec or vice versa.
+
+### 7.4 Passthrough (`nodes/codec/passthrough.py`)
 
 Explicit-only codec for legacy/simple channels. Stores the original wire text
 in `extensions["_passthrough_raw"]`; `serialize` returns it unchanged.
 
-### 7.4 HL7 v2.5.1 (`nodes/codec/hl7v2/`)
+### 7.5 HL7 v2.5.1 (`nodes/codec/hl7v2/`)
 
 - **`er7.py`** — low-level ER7 primitives: segmentation, component/sub-component
   splitting, and HL7 escaping (`\F\`=^, `\S\`=`|`, `\T\`=&, `\R\`=~, `\E\`=\\).
@@ -283,7 +320,7 @@ in `extensions["_passthrough_raw"]`; `serialize` returns it unchanged.
 Round-trip-safe: escaping/unescaping, `date` handling (`1990-01-02` not
 midnight), and OBX-8 flags survive canonical → HL7 → canonical.
 
-### 7.5 FHIR R4 (`nodes/codec/fhir/codec.py`)
+### 7.6 FHIR R4 (`nodes/codec/fhir/codec.py`)
 
 Maps canonical → a JSON **Bundle** of `Patient`, `ServiceRequest`, `Specimen`,
 `Observation`, and back:
@@ -317,6 +354,12 @@ optional **idempotency** and **`max_queue_depth` backpressure**.
 | file_watcher | `file_watcher.py` | Polls a directory for `.csv/.hl7/.txt`; **claims a file by renaming to `.processing`** (crash-safe: leftovers are re-queued on restart) then moves it to `processed/` or `failed/`. Reads with `newline=""` so `\r` (HL7 segment separators) are preserved. |
 | db_poller | `db_poller.py` | Polls a DB (SQLite/PostgreSQL/MySQL via SQLAlchemy) on an interval; each row enqueued as JSON. Optional cursor-based incremental pulls via `cursor_field`/`cursor_param`, and an `idempotency_key_field`. |
 
+The schemaless transports (`http_webhook`, `http_poller`, `db_poller`) now
+default their **inbound codec to `schemaless.json`** so flat dot-notation rows
+unflatten into a nested canonical tree before outbound encoding. `mllp` /
+`file_watcher` carry raw wire text (HL7 / CSV) and pair naturally with
+structured codecs (`hl7v2.*`, `fhir.r4`).
+
 ## 9. Enrichment (`nodes/enrichment/batch_lookup.py`)
 
 `BatchLookup` resolves reference data (patient name, doctor id, test code…) for a
@@ -329,10 +372,17 @@ catches and DLQs it). Lookup keys are canonical paths into the message
 ## 10. Transform (`nodes/transform/`)
 
 - `field_mapper.py` — `FieldMapper(mappings)` where a mapping is
-  `{source, target, required?, fn?, fn_args?}`. Sources are canonical paths or
-  `lookups.<name>.<field>`; targets are canonical paths written back onto a
-  copy of the message so untouched fields survive. The mapped result is
-  re-validated into a `CanonicalMessage`.
+  `{source, target, required?, fn?, fn_args?}`. Sources are canonical paths,
+  `lookups.<name>.<field>`, or `extensions.*` (inbound data preserved by the
+  schemaless codec); targets are canonical paths (or `extensions.*`) written
+  back onto a copy of the message so untouched fields survive. The mapped
+  result is re-validated into a `CanonicalMessage`. Each rule may apply a
+  whitelisted function from `nodes/transform/functions.py`
+  (`Uppercase`, `Lowercase`, `Trim Whitespace`, `Format`, `Default`) plus
+  JSON `fn_args`; the channel-editor Map step exposes both (Function dropdown
+  and a context-sensitive Args box that turns into a date-format field for
+  `Format` and a fallback-value field for `Default`) in sync with the backend
+  registry.
 - `functions.py` — **whitelisted** transform functions only (no `eval`/scripting):
   `Uppercase`, `Lowercase`, `Trim Whitespace`, `Format` (date),
   `Default`. Unknown names fail loudly at config time.
