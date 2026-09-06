@@ -22,6 +22,12 @@ python -m engine.main   # background worker daemon: drains queues, runs pollers/
 
 Open `http://localhost:5000` for the dashboard.
 
+## Screenshots
+
+The main control-plane dashboard — live channel health, queue metrics, and the configured-channels table, all re-rendered in place via HTMX:
+
+![Integration Engine Dashboard](docs/screenshots/dashboard.png)
+
 ## Architecture
 
 - **Case 1 — Ingestion**:
