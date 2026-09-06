@@ -1,324 +1,25 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Integration Engine Control Plane</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <style>
-        :root {
-            --bg-page: #e2e8f0;
-            --panel-bg: #f8fafc;
-            --panel-border: #94a3b8;
-            --header-grad-top: #334155;
-            --header-grad-bot: #0f172a;
-            --accent-blue: #0284c7;
-            --accent-blue-hover: #0369a1;
-            --status-green: #16a34a;
-            --status-yellow: #ca8a04;
-            --status-red: #dc2626;
-            --text-main: #0f172a;
-            --text-muted: #475569;
-            --code-font: 'Courier New', Courier, monospace;
-        }
+{% extends "base.html" %}
 
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
+{% block title %}Integration Engine Control Plane{% endblock %}
 
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg-page);
-            color: var(--text-main);
-            font-size: 14px;
-            padding: 20px;
-        }
-
-        .page-wrap {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        header {
-            background: linear-gradient(180deg, var(--header-grad-top) 0%, var(--header-grad-bot) 100%);
-            color: #ffffff;
-            padding: 14px 22px;
-            border-radius: 5px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 18px;
-            border-bottom: 2px solid var(--accent-blue);
-        }
-
-        header h1 {
-            font-size: 18px;
-            font-weight: bold;
-            letter-spacing: 0.5px;
-            text-shadow: 1px 1px 2px #000;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        header .status-tag {
-            background: #1e293b;
-            border: 1px solid #475569;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 12px;
-            color: #38bdf8;
-            font-weight: normal;
-        }
-
-        .tab-bar {
-            display: flex;
-            gap: 6px;
-            margin-bottom: -1px;
-            padding-left: 10px;
-        }
-
-        .tab {
-            background: linear-gradient(180deg, #cbd5e1 0%, #94a3b8 100%);
-            border: 1px solid var(--panel-border);
-            border-bottom: none;
-            padding: 9px 20px;
-            font-weight: bold;
-            color: #1e293b;
-            cursor: pointer;
-            border-top-left-radius: 5px;
-            border-top-right-radius: 5px;
-            font-size: 13px;
-            text-shadow: 0 1px 0 #f1f5f9;
-        }
-
-        .tab.active {
-            background: #ffffff;
-            color: var(--accent-blue);
-            border-bottom: 1px solid #ffffff;
-            position: relative;
-            z-index: 2;
-        }
-
-        .main-window {
-            background: #ffffff;
-            border: 1px solid var(--panel-border);
-            border-radius: 5px;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
-            padding: 20px;
-            position: relative;
-            z-index: 1;
-        }
-
-        .grid-2col {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            align-items: start;
-        }
-
-        .section-box {
-            border: 1px solid #cbd5e1;
-            border-radius: 4px;
-            background: #f8fafc;
-            overflow: hidden;
-            margin-bottom: 18px;
-        }
-
-        .section-box h2 {
-            background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
-            border-bottom: 1px solid #cbd5e1;
-            padding: 9px 14px;
-            font-size: 13px;
-            font-weight: bold;
-            color: #334155;
-            text-shadow: 0 1px 0 #fff;
-        }
-
-        .section-header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
-            border-bottom: 1px solid #cbd5e1;
-            padding-right: 14px;
-        }
-
-        .section-body {
-            padding: 16px;
-        }
-
-        table.data-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-            background: #fff;
-        }
-
-        table.data-table th {
-            background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
-            color: #334155;
-            text-align: left;
-            padding: 9px 12px;
-            border: 1px solid #cbd5e1;
-            font-weight: bold;
-            text-shadow: 0 1px 0 #fff;
-        }
-
-        table.data-table td {
-            padding: 9px 12px;
-            border: 1px solid #e2e8f0;
-            vertical-align: middle;
-        }
-
-        table.data-table tr:nth-child(even) {
-            background-color: #f8fafc;
-        }
-
-        .entry-link {
-            color: var(--accent-blue);
-            text-decoration: none;
-            cursor: pointer;
-        }
-
-        .entry-link:hover {
-            text-decoration: underline;
-            color: var(--accent-blue-hover);
-        }
-
-        .pill {
-            display: inline-block;
-            padding: 2px 7px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: bold;
-            color: #fff;
-            text-transform: uppercase;
-        }
-
-        .pill-running { background-color: var(--status-green); }
-        .pill-paused { background-color: var(--status-yellow); }
-        .pill-error { background-color: var(--status-red); }
-
-        .btn {
-            background: linear-gradient(180deg, #ffffff 0%, #e2e8f0 100%);
-            border: 1px solid #94a3b8;
-            border-radius: 4px;
-            padding: 5px 12px;
-            font-size: 11px;
-            font-weight: bold;
-            color: #334155;
-            cursor: pointer;
-            box-shadow: inset 0 1px 0 #fff;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-        }
-
-        .btn:hover {
-            background: linear-gradient(180deg, #f1f5f9 0%, #cbd5e1 100%);
-        }
-
-        .btn:active {
-            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2);
-        }
-
-        .btn-primary {
-            background: linear-gradient(180deg, #38bdf8 0%, var(--accent-blue) 100%);
-            border-color: #0369a1;
-            color: #ffffff;
-            text-shadow: 0 -1px 0 rgba(0,0,0,0.3);
-        }
-
-        .btn-danger {
-            background: linear-gradient(180deg, #fca5a5 0%, var(--status-red) 100%);
-            border-color: #991b1b;
-            color: #ffffff;
-            text-shadow: 0 -1px 0 rgba(0,0,0,0.3);
-        }
-
-        .code-block {
-            font-family: var(--code-font);
-            background: #0f172a;
-            color: #38bdf8;
-            padding: 12px;
-            border-radius: 4px;
-            font-size: 11px;
-            line-height: 1.5;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            border: 1px solid #334155;
-            min-height: 140px;
-        }
-
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 14px;
-            margin-bottom: 18px;
-        }
-
-        .metric-card {
-            background: #ffffff;
-            border: 1px solid #cbd5e1;
-            padding: 12px;
-            border-radius: 4px;
-            text-align: center;
-        }
-
-        .metric-card .val {
-            font-size: 20px;
-            font-weight: bold;
-            color: var(--accent-blue);
-            display: flex;
-            align-items: baseline;
-            justify-content: center;
-            gap: 3px;
-        }
-
-        .metric-card .lbl {
-            font-size: 10px;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            font-weight: bold;
-        }
-
-        .metric-card .sub {
-            font-size: 10px;
-            color: var(--text-muted);
-            margin-top: 3px;
-        }
-
-        @media (max-width: 900px) {
-            .grid-2col { grid-template-columns: 1fr; }
-            .metric-grid { grid-template-columns: repeat(2, 1fr); }
-        }
-    </style>
-</head>
-<body>
-  <div class="page-wrap">
-
+{% block header %}
     <header>
         <h1><span>&#9881;</span> Integration Engine Dashboard</h1>
         <div style="display: flex; align-items: center; gap: 12px;">
-            <button class="btn btn-primary"
-                    hx-post="/ui/test/simulate"
-                    hx-target=".metric-grid">
-                + Inject Test Payloads
-            </button>
-            <div class="status-tag">
-                Engine: <strong>ONLINE</strong> (SQLite WAL) &nbsp;|&nbsp; Health: <strong>OK</strong>
+            <div class="status-tag" hx-get="/health" hx-trigger="load, every 5s">
+                Engine: <strong>--</strong> &nbsp;|&nbsp; Channels: <strong>--</strong>
             </div>
         </div>
     </header>
+{% endblock %}
+
+{% block content %}
 
     <div class="tab-bar">
-        <div class="tab active" id="tab-btn-dashboard" onclick="switchTab('dashboard')">Channel Control</div>
-        <div class="tab" id="tab-btn-inspector" onclick="switchTab('inspector')">Engine Inspector</div>
-        <div class="tab" id="tab-btn-editor" onclick="switchTab('editor')">Add / Edit Channel</div>
+        <div class="tab active" id="tab-btn-dashboard" onclick="switchTab('dashboard')" title="View channel status, metrics, and manage channels">Channel Control</div>
+        <div class="tab" id="tab-btn-inspector" onclick="switchTab('inspector')" title="View dead-letter queue and trace messages by ID">Engine Inspector</div>
+        <div class="tab" id="tab-btn-editor" onclick="switchTab('editor')" title="Create or modify a channel configuration">Add / Edit Channel</div>
+        <div class="tab" id="tab-btn-defs" onclick="switchTab('defs')" title="Manage reusable mappings, enrichments, and retry policies">Definitions</div>
     </div>
 
     <div class="main-window">
@@ -326,11 +27,11 @@
         <!-- Dashboard Panel -->
         <div id="panel-dashboard">
             <!-- Metrics (Real-time DB counts polling every 2s) -->
-            <div class="metric-grid" hx-get="/ui/metrics" hx-trigger="load, every 2s">
-                <div class="metric-card"><div class="val">-</div><div class="lbl">Healthy Channels</div></div>
-                <div class="metric-card"><div class="val">-</div><div class="lbl">Queue Depth</div></div>
-                <div class="metric-card"><div class="val">-</div><div class="lbl">DLQ Count</div></div>
-                <div class="metric-card"><div class="val">-</div><div class="lbl">Delivered Total</div></div>
+            <div class="metric-grid" hx-get="/ui/metrics" hx-trigger="load, every 2s" hx-swap="innerHTML">
+                <div class="metric-card"><div class="val">-</div><div class="lbl" title="Channels that are running and not degraded">Healthy Channels</div></div>
+                <div class="metric-card"><div class="val">-</div><div class="lbl" title="Messages waiting to be processed">Queue Depth</div></div>
+                <div class="metric-card"><div class="val">-</div><div class="lbl" title="Messages that failed all retries">DLQ Count</div></div>
+                <div class="metric-card"><div class="val">-</div><div class="lbl" title="Total successfully delivered messages">Delivered Total</div></div>
             </div>
 
             <div class="section-box">
@@ -365,10 +66,10 @@
 
                 <div class="section-box" style="margin-bottom: 0;">
                     <div class="section-header-row">
-                        <h2 style="border-bottom: none;">Dead-Letter Queue (DLQ) Records</h2>
+                        <h2 style="border-bottom: none;">Dead-Letter Queue (failed messages)</h2>
                         <div style="display: flex; gap: 6px; padding: 6px 0;">
-                            <button class="btn btn-primary" hx-post="/ui/dlq/requeue" hx-target="#dlq-table-body">Re-queue All</button>
-                            <button class="btn btn-danger" hx-post="/ui/dlq/clear" hx-target="#dlq-table-body">Clear DLQ</button>
+                            <button class="btn btn-primary" hx-post="/ui/dlq/requeue" hx-target="#dlq-table-body" title="Move all failed messages back into the processing queue">Re-queue All</button>
+                            <button class="btn btn-danger" hx-post="/ui/dlq/clear" hx-target="#dlq-table-body" title="Permanently delete all dead-lettered messages">Clear DLQ</button>
                         </div>
                     </div>
                     <div class="section-body">
@@ -393,8 +94,9 @@
                         <h2>Message Audit Trail Lookup</h2>
                         <div class="section-body">
                             <div style="display: flex; gap: 6px; margin-bottom: 12px;">
-                                <input type="text" id="audit-trace-id-input" name="trace_id" placeholder="Paste a trace_id (queued, delivered, or DLQ)"
-                                       style="flex: 1; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-family: var(--code-font); font-size: 11px;">
+                                <input type="text" id="audit-trace-id-input" name="trace_id" placeholder="Paste a trace_id to find a specific message across all channels"
+                                       style="flex: 1; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-family: var(--code-font); font-size: 11px;"
+                                       title="A trace_id uniquely identifies a message. You can find one in the DLQ table above or in a channel's message list.">
                                 <button class="btn btn-primary"
                                         hx-get="/ui/audit"
                                         hx-include="#audit-trace-id-input"
@@ -412,6 +114,20 @@
             </div>
         </div>
 
+        <!-- Definitions Panel -->
+        <div id="panel-defs" style="display: none;">
+            <div class="section-box" style="margin-bottom: 0;">
+                <div class="section-header-row">
+                    <h2 style="border-bottom: none;">Reusable Definitions</h2>
+                    <span style="font-size: 11px; color: var(--text-muted);">mappings (data transformations) · enrichments (database lookups) · retry policies</span>
+                </div>
+                <div class="section-body" id="defs-container"
+                     hx-get="/ui/defs" hx-trigger="revealed">
+                    <div class="code-block">Loading definitions...</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Editor Panel -->
         <div id="panel-editor" style="display: none;">
             <div class="section-box" style="margin-bottom: 0;">
@@ -425,8 +141,12 @@
     </div>
   </div>
 
-    <script>
-        const TAB_IDS = ['dashboard', 'inspector', 'editor'];
+    
+{% endblock %}
+
+{% block scripts %}
+<script>
+        const TAB_IDS = ['dashboard', 'inspector', 'editor', 'defs'];
 
         function switchTab(tabId) {
             TAB_IDS.forEach(function(id) {
@@ -441,7 +161,14 @@
                     htmx.ajax('GET', '/ui/channels/new', '#editor-container');
                 }
             }
+            if (tabId === 'defs') {
+                // Trigger HTMX load if the container hasn't loaded yet
+                const container = document.getElementById('defs-container');
+                if (!container.innerHTML.trim() || container.querySelector('.code-block')) {
+                    htmx.ajax('GET', '/ui/defs', '#defs-container');
+                }
+            }
         }
     </script>
-</body>
-</html>
+
+{% endblock %}

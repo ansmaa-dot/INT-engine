@@ -1,3 +1,4 @@
+import json
 from core.queue import PersistentQueue
 from core.message import Envelope
 from engine.config_loader import ChannelConfigRegistry
@@ -15,7 +16,7 @@ runner = registry.build_runner("his_to_lis", queue)
 print("2. Runner Destination Target:", runner.destination.endpoint_url if hasattr(runner, 'destination') else "NO DESTINATION")
 
 # 4. Enqueue & Process Synchronously
-env = Envelope(channel_id="his_to_lis", raw_payload={"order_id": 1234, "doctor_username": "dr_house", "test_code": "CBC"})
+env = Envelope(channel_id="his_to_lis", raw=json.dumps({"order_id": 1234, "doctor_username": "dr_house", "test_code": "CBC"}))
 queue.enqueue(env)
 print("3. Enqueued Trace ID:", env.trace_id)
 

@@ -1,18 +1,16 @@
-import json
 import os
 
 from nodes.base import DestinationNode
+from core.transport import DestinationMessage
 
 
 class SFTPClientNode(DestinationNode):
-    """SFTP destination: uploads each payload as a file to a remote SFTP
-    server. Supports both password and private-key authentication.
+    """SFTP destination: uploads already-serialized content as a file to a
+    remote SFTP server. Supports both password and private-key authentication.
 
-    Payload handling:
-      - dict with a "filename" key -> uses that as the remote filename
-      - dict with a "content" key -> writes that content (str or bytes)
-      - any other dict -> serialized to JSON
-      - str/bytes -> written as-is
+    The filename comes from the DestinationMessage (explicit delivery
+    metadata) or a generated default. There is no payload sniffing: content
+    must already be str/bytes — the destination never serializes dicts.
     """
 
     def __init__(self, host: str, port: int = 22, username: str = "",
@@ -20,6 +18,8 @@ class SFTPClientNode(DestinationNode):
                  private_key_passphrase: str | None = None,
                  remote_dir: str = ".", filename_field: str | None = None,
                  content_field: str | None = None, timeout: int = 10):
+        # filename_field / content_field are retained for config compatibility
+        # but the payload contract no longer inspects dict fields.
         self.host = host
         self.port = port
         self.username = username
@@ -68,12 +68,12 @@ class SFTPClientNode(DestinationNode):
             )
         return client
 
-    def send(self, payload):
+    def send(self, message: DestinationMessage):
         client = self._connect()
         try:
             sftp = client.open_sftp()
 
-            filename, content = self._prepare_payload(payload)
+            filename, content = self._prepare_payload(message)
 
             remote_path = os.path.join(self.remote_dir, filename)
             with sftp.open(remote_path, "wb") as f:
@@ -88,35 +88,20 @@ class SFTPClientNode(DestinationNode):
 
         return remote_path
 
-    def _prepare_payload(self, payload):
-        """Returns (filename, content) where content is str or bytes."""
-        filename = None
-        content = None
+    def _prepare_payload(self, message: DestinationMessage):
+        """Returns (filename, content). Filename is explicit delivery
+        metadata or a generated default; content must already be str/bytes."""
+        content = message.content
+        if not isinstance(content, (str, bytes)):
+            raise TypeError(
+                "destination content must be str/bytes; destination does not serialize"
+            )
 
-        if isinstance(payload, dict):
-            # Explicit filename/content fields take priority
-            if self.filename_field and self.filename_field in payload:
-                filename = str(payload[self.filename_field])
-            elif "filename" in payload:
-                filename = str(payload["filename"])
-
-            if self.content_field and self.content_field in payload:
-                content = payload[self.content_field]
-            elif "content" in payload:
-                content = payload["content"]
-
-            if filename is None:
-                filename = f"message_{payload.get('trace_id', 'unknown')}.json"
-            if content is None:
-                content = json.dumps(payload, default=str)
-        elif isinstance(payload, str):
-            filename = f"message_{abs(hash(payload))}.txt"
-            content = payload
-        elif isinstance(payload, bytes):
-            filename = f"message_{abs(hash(payload))}.bin"
-            content = payload
+        if message.filename:
+            filename = message.filename
         else:
-            filename = f"message_{abs(hash(str(payload)))}.json"
-            content = json.dumps(payload, default=str)
+            seed = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else content
+            ext = "bin" if isinstance(content, bytes) else "txt"
+            filename = f"message_{abs(hash(seed))}.{ext}"
 
         return filename, content

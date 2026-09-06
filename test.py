@@ -1,4 +1,5 @@
 # test_runner.py
+import json
 from core.message import Envelope
 from core.queue import PersistentQueue
 from nodes.transform.field_mapper import FieldMapper
@@ -14,9 +15,9 @@ mapper = FieldMapper([
 
 runner = ChannelRunner("his_to_lis", queue, mapper)
 
-# 1. Enqueue 1 valid message and 1 bad message missing 'order_id'
-queue.enqueue(Envelope(channel_id="his_to_lis", raw_payload={"order_id": 5001, "test": "URINALYSIS"}))
-queue.enqueue(Envelope(channel_id="his_to_lis", raw_payload={"test": "METABOLIC_PANEL"}))
+# 1. Enqueue 1 message with the expected field and 1 message missing it
+queue.enqueue(Envelope(channel_id="his_to_lis", raw=json.dumps({"order_id": 5001, "test": "URINALYSIS"})))
+queue.enqueue(Envelope(channel_id="his_to_lis", raw=json.dumps({"test": "METABOLIC_PANEL"})))
 
 print("Processing queue batch...")
 runner.process_one()  # Should succeed

@@ -3,7 +3,7 @@ import hmac
 
 from flask import Blueprint, request, jsonify, abort
 
-from core.message import Envelope
+from core.transport import TransportMessage, to_envelope
 
 
 class WebhookRegistry:
@@ -26,12 +26,14 @@ class WebhookRegistry:
 
     def register(self, channel_id: str, shared_secret: str | None = None,
                  sig_header: str = "X-Signature", max_queue_depth: int | None = None,
-                 idempotency_key_field: str | None = None):
+                 idempotency_key_field: str | None = None,
+                 inbound_codec: str = "schemaless.json"):
         self._channels[channel_id] = {
             "secret": shared_secret,
             "sig_header": sig_header,
             "max_queue_depth": max_queue_depth,
             "idempotency_key_field": idempotency_key_field,
+            "inbound_codec": inbound_codec,
         }
 
     def unregister(self, channel_id: str):
@@ -45,6 +47,9 @@ class WebhookRegistry:
         if cfg is None:
             abort(404, description="unknown or disabled webhook channel")
 
+        # Raw request body only — no format parsing in the transport. The
+        # inbound codec (decide from channel config, later pipeline stage)
+        # interprets the content.
         raw_body = request.get_data()
 
         if cfg["secret"]:
@@ -53,10 +58,6 @@ class WebhookRegistry:
             if not sig or not hmac.compare_digest(sig, expected):
                 abort(401, description="invalid signature")
 
-        payload = request.get_json(silent=True)
-        if payload is None:
-            abort(400, description="expected JSON body")
-
         max_depth = cfg.get("max_queue_depth")
         if max_depth is not None and self.queue.queue_depth(channel_id) >= max_depth:
             # backpressure: reject with 503 so a well-behaved sender retries
@@ -64,10 +65,12 @@ class WebhookRegistry:
             # unboundedly growing the queue
             return jsonify({"status": "rejected", "reason": "queue at capacity"}), 503
 
-        env = Envelope(channel_id=channel_id, raw_payload=payload)
-        key_field = cfg.get("idempotency_key_field")
-        if key_field and isinstance(payload, dict):
-            env.idempotency_key = str(payload.get(key_field, "")) or None
+        msg = TransportMessage(
+            raw=raw_body,
+            source=channel_id,
+            content_type=request.content_type,
+        )
+        env = to_envelope(channel_id, msg, cfg.get("inbound_codec", "json"))
 
         accepted = self.queue.enqueue(env)
         if not accepted:

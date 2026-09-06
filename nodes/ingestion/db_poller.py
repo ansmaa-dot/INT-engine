@@ -1,7 +1,8 @@
+import json
 import threading
 import time
 
-from core.message import Envelope
+from core.transport import TransportMessage, to_envelope
 from nodes.base import IngestionNode
 
 
@@ -19,7 +20,8 @@ class DBPoller(IngestionNode):
                  cursor_field: str | None = None,
                  cursor_param: str | None = None,
                  max_queue_depth: int | None = None,
-                 idempotency_key_field: str | None = None):
+                 idempotency_key_field: str | None = None,
+                 inbound_codec: str = "schemaless.json"):
         if interval_s < 5:
             raise ValueError("interval_s must be >= 5")
         self.connection_string = connection_string
@@ -32,6 +34,7 @@ class DBPoller(IngestionNode):
         self.cursor_param = cursor_param
         self.max_queue_depth = max_queue_depth
         self.idempotency_key_field = idempotency_key_field
+        self.inbound_codec = inbound_codec
         self._cursor = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -87,9 +90,17 @@ class DBPoller(IngestionNode):
             rows = [dict(zip(column_names, row)) for row in result.fetchall()]
 
         for row in rows:
-            env = Envelope(channel_id=self.channel_id, raw_payload=row)
+            # Each row is delivered as raw serialized content in the new
+            # input contract. The optional idempotency hint reads a column
+            # from the already-structured row — not a wire-format parser.
+            message_id = None
             if self.idempotency_key_field and isinstance(row, dict):
-                env.idempotency_key = str(row.get(self.idempotency_key_field, "")) or None
-            self.queue.enqueue(env)
+                message_id = str(row.get(self.idempotency_key_field, "")) or None
+            msg = TransportMessage(
+                raw=json.dumps(row) if isinstance(row, dict) else str(row),
+                source=self.channel_id,
+                message_id=message_id,
+            )
+            self.queue.enqueue(to_envelope(self.channel_id, msg, self.inbound_codec))
             if self.cursor_field and isinstance(row, dict):
                 self._cursor = row.get(self.cursor_field, self._cursor)

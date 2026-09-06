@@ -3,6 +3,22 @@ import json
 import sqlite3
 import uuid
 from core.message import Envelope, MessageState
+from core.model import CanonicalMessage
+
+
+def _json_text(obj) -> str | None:
+    """Serialize an object for a TEXT column.
+
+    CanonicalMessage instances are dumped via pydantic's JSON mode so the
+    stored JSON exactly matches what ``Envelope.from_dict`` parses back.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, CanonicalMessage):
+        return json.dumps(obj.model_dump(mode="json"))
+    if isinstance(obj, (dict, list)):
+        return json.dumps(obj, default=str)
+    return str(obj)
 
 
 class PersistentQueue:
@@ -28,9 +44,10 @@ class PersistentQueue:
                     channel_id TEXT NOT NULL,
                     state TEXT NOT NULL,
                     attempts INTEGER DEFAULT 0,
-                    raw_payload TEXT NOT NULL,
-                    transformed_payload TEXT,
-                    last_error TEXT,
+                    raw TEXT,
+                    inbound_codec TEXT NOT NULL DEFAULT 'json',
+                    canonical TEXT,
+                    error TEXT,
                     created_at TEXT NOT NULL,
                     next_retry_at TEXT,
                     idempotency_key TEXT,
@@ -38,24 +55,6 @@ class PersistentQueue:
                     claim_token TEXT
                 )
             """)
-            existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(queue)")}
-            for col, coltype in (("idempotency_key", "TEXT"), ("claimed_at", "TEXT"), ("claim_token", "TEXT"), ("last_traceback", "TEXT")):
-                if col not in existing_cols:
-                    conn.execute(f"ALTER TABLE queue ADD COLUMN {col} {coltype}")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS channels (
-                    channel_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    enabled INTEGER DEFAULT 1,
-                    status TEXT DEFAULT 'running',
-                    type TEXT,
-                    retry_policy TEXT,
-                    mapping_rules TEXT,
-                    destination TEXT
-                )
-            """)
-            # one row per (channel_id, idempotency_key) ever accepted — a UNIQUE
-            # constraint violation on insert is how a duplicate gets detected
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS idempotency_keys (
                     channel_id TEXT NOT NULL,
@@ -81,6 +80,12 @@ class PersistentQueue:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_log (trace_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_channel_state ON queue (channel_id, state)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS heartbeat (
+                    id INTEGER PRIMARY KEY,
+                    last_beat_at TEXT NOT NULL
+                )
+            """)
             conn.commit()
 
     # --- idempotency -----------------------------------------------------
@@ -127,15 +132,20 @@ class PersistentQueue:
         with self._get_conn() as conn:
             conn.execute(
                 """
-                INSERT INTO queue (trace_id, channel_id, state, attempts, raw_payload, created_at, next_retry_at, idempotency_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO queue (trace_id, channel_id, state, attempts, raw,
+                                   inbound_codec, canonical, error, created_at,
+                                   next_retry_at, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     envelope.trace_id,
                     envelope.channel_id,
                     state_str,
                     envelope.attempts,
-                    json.dumps(envelope.raw_payload),
+                    envelope.raw,
+                    envelope.inbound_codec,
+                    _json_text(envelope.canonical),
+                    _json_text(envelope.error),
                     envelope.created_at,
                     now_iso,
                     envelope.idempotency_key,
@@ -144,7 +154,7 @@ class PersistentQueue:
             conn.commit()
 
         self.record_audit(envelope.trace_id, envelope.channel_id, "queued",
-                           {"raw_payload": envelope.raw_payload})
+                           {"raw": envelope.raw, "inbound_codec": envelope.inbound_codec})
         return True
 
     def dequeue_available(self, channel_id: str):
@@ -194,8 +204,9 @@ class PersistentQueue:
 
     # --- state transitions -------------------------------------------------
 
-    def mark_retry(self, trace_id: str, attempts: int, delay_seconds: int, error_msg: str, traceback_str: str | None = None):
-        """Schedules a message for retry using exponential backoff."""
+    def mark_retry(self, trace_id: str, attempts: int, delay_seconds: int, error: dict):
+        """Schedules a message for retry using exponential backoff. ``error``
+        is the structured pipeline error dict (stage/code/message/traceback)."""
         next_retry = (
             datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         ).isoformat()
@@ -209,18 +220,19 @@ class PersistentQueue:
             conn.execute(
                 """
                 UPDATE queue 
-                SET state = ?, attempts = ?, last_error = ?, last_traceback = ?, next_retry_at = ?
+                SET state = ?, attempts = ?, error = ?, next_retry_at = ?
                 WHERE trace_id = ?
             """,
-                (queued_state, attempts, error_msg, traceback_str, next_retry, trace_id),
+                (queued_state, attempts, _json_text(error), next_retry, trace_id),
             )
             conn.commit()
 
         self.record_audit(trace_id, self._channel_for(trace_id), "retry_scheduled",
-                           {"attempts": attempts, "delay_seconds": delay_seconds, "error": error_msg})
+                           {"attempts": attempts, "delay_seconds": delay_seconds, "error": error})
 
-    def mark_dead_letter(self, trace_id: str, attempts: int, error_msg: str, traceback_str: str | None = None):
-        """Permanently moves message to DLQ after exhausting retry attempts."""
+    def mark_dead_letter(self, trace_id: str, attempts: int, error: dict):
+        """Permanently moves message to DLQ after exhausting retry attempts.
+        ``error`` is the structured pipeline error dict."""
         dlq_state = (
             MessageState.DEAD_LETTER.value
             if hasattr(MessageState.DEAD_LETTER, "value")
@@ -231,17 +243,45 @@ class PersistentQueue:
             conn.execute(
                 """
                 UPDATE queue 
-                SET state = ?, attempts = ?, last_error = ?, last_traceback = ?, next_retry_at = NULL
+                SET state = ?, attempts = ?, error = ?, next_retry_at = NULL
                 WHERE trace_id = ?
             """,
-                (dlq_state, attempts, error_msg, traceback_str, trace_id),
+                (dlq_state, attempts, _json_text(error), trace_id),
             )
             conn.commit()
 
         self.record_audit(trace_id, self._channel_for(trace_id), "dead_lettered",
-                           {"attempts": attempts, "error": error_msg})
+                           {"attempts": attempts, "error": error})
 
-    def mark_delivered(self, trace_id: str, transformed_payload: dict):
+    def mark_discarded(self, trace_id: str, attempts: int, error: dict):
+        """Filters a message out permanently (filter on_fail=discard).
+        
+        Distinct from ``mark_dead_letter`` — a filtered-out message was
+        correctly excluded by design, not a failure needing attention.
+        Uses its own ``DISCARDED`` state and ``discarded`` audit event
+        so DLQ counts and discard counts never merge (D6/D9).
+        """
+        discarded_state = (
+            MessageState.DISCARDED.value
+            if hasattr(MessageState.DISCARDED, "value")
+            else str(MessageState.DISCARDED)
+        ).upper()
+
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE queue 
+                SET state = ?, attempts = ?, error = ?, next_retry_at = NULL
+                WHERE trace_id = ?
+            """,
+                (discarded_state, attempts, _json_text(error), trace_id),
+            )
+            conn.commit()
+
+        self.record_audit(trace_id, self._channel_for(trace_id), "discarded",
+                           {"attempts": attempts, "error": error})
+
+    def mark_delivered(self, trace_id: str, canonical: CanonicalMessage | None, attempts: int = 0):
         delivered_state = (
             MessageState.DELIVERED.value
             if hasattr(MessageState.DELIVERED, "value")
@@ -252,15 +292,15 @@ class PersistentQueue:
             conn.execute(
                 """
                 UPDATE queue 
-                SET state = ?, transformed_payload = ?, next_retry_at = NULL
+                SET state = ?, attempts = ?, canonical = ?, next_retry_at = NULL
                 WHERE trace_id = ?
             """,
-                (delivered_state, json.dumps(transformed_payload), trace_id),
+                (delivered_state, attempts, _json_text(canonical), trace_id),
             )
             conn.commit()
 
         self.record_audit(trace_id, self._channel_for(trace_id), "delivered",
-                           {"transformed_payload": transformed_payload})
+                           {"canonical": canonical.model_dump(mode="json") if canonical else None})
 
     def _channel_for(self, trace_id: str) -> str:
         with self._get_conn() as conn:
@@ -306,6 +346,25 @@ class PersistentQueue:
                 "SELECT COUNT(*) FROM queue WHERE channel_id = ? AND UPPER(state) = 'QUEUED'",
                 (channel_id,),
             ).fetchone()[0]
+
+    def update_heartbeat(self) -> None:
+        """Called by the worker daemon to signal it's alive."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO heartbeat (id, last_beat_at) VALUES (1, ?)",
+                (now_iso,),
+            )
+            conn.commit()
+
+    def get_heartbeat_age_s(self) -> float | None:
+        """Returns seconds since the last heartbeat, or None if never set."""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT last_beat_at FROM heartbeat WHERE id = 1").fetchone()
+        if not row or not row["last_beat_at"]:
+            return None
+        last = datetime.fromisoformat(row["last_beat_at"])
+        return (datetime.now(timezone.utc) - last).total_seconds()
 
     def reclaim_stale_processing(self, older_than_seconds: int = 120) -> int:
         """If a worker crashes between claiming a message (PROCESSING) and

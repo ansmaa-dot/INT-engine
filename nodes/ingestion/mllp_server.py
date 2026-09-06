@@ -2,7 +2,7 @@ import socket
 import threading
 import time
 
-from core.message import Envelope
+from core.transport import TransportMessage, to_envelope
 from nodes.base import IngestionNode
 
 VT = b"\x0b"
@@ -27,13 +27,15 @@ class MLLPServer(IngestionNode):
     def __init__(self, host: str, port: int, channel_id: str, queue,
                  max_connections: int = 20, idle_timeout_s: int = 300,
                  max_queue_depth: int | None = None,
-                 idempotency_from_msh10: bool = False):
+                 idempotency_from_msh10: bool = False,
+                 inbound_codec: str = "json"):
         self.host = host
         self.port = port
         self.channel_id = channel_id
         self.queue = queue
         self.max_queue_depth = max_queue_depth
         self.idempotency_from_msh10 = idempotency_from_msh10
+        self.inbound_codec = inbound_codec
 
         self._sem = threading.Semaphore(max_connections)
         self.idle_timeout_s = idle_timeout_s
@@ -106,7 +108,10 @@ class MLLPServer(IngestionNode):
             client_sock.close()
 
     def _process_message(self, raw_hl7: str) -> bytes:
-        control_id, ack_code = self._parse_msh(raw_hl7)
+        # The transport only extracts the MSH-10 control ID — a thin
+        # idempotency/ACK hint, not HL7 parsing. The full decode happens in
+        # the pipeline's codec stage.
+        control_id = self._extract_control_id(raw_hl7)
 
         if self.max_queue_depth is not None:
             depth = self.queue.queue_depth(self.channel_id)
@@ -117,11 +122,12 @@ class MLLPServer(IngestionNode):
                 # the socket while the queue drains.
                 return self._build_ack(control_id, "AE")
 
-        env = Envelope(channel_id=self.channel_id, raw_payload={"hl7": raw_hl7})
-        if self.idempotency_from_msh10 and control_id:
-            env.idempotency_key = control_id
-
-        accepted = self.queue.enqueue(env)  # persisted BEFORE the ACK goes out
+        msg = TransportMessage(
+            raw=raw_hl7,
+            source=self.channel_id,
+            message_id=control_id if self.idempotency_from_msh10 else None,
+        )
+        accepted = self.queue.enqueue(to_envelope(self.channel_id, msg, self.inbound_codec))  # persisted BEFORE the ACK goes out
         if not accepted:
             # duplicate message control ID — already processed, ACK success
             # anyway so the sender doesn't spin retrying a message we've
@@ -130,21 +136,24 @@ class MLLPServer(IngestionNode):
 
         return self._build_ack(control_id, "AA")
 
-    def _parse_msh(self, raw_hl7: str):
-        """Extracts field separator, MSH-10 (message control ID) for the ACK,
-        best-effort — malformed input still gets an ACK, just without an
-        echoed control ID."""
+    def _extract_control_id(self, raw_hl7: str) -> str | None:
+        """Thin, best-effort extraction of MSH-10 (message control ID).
+
+        Used ONLY for early enqueue-time idempotency and ACK echo. This is a
+        hint, not an HL7 parser — malformed input still gets an ACK, just
+        without an echoed control ID, and no other message content is
+        interpreted here (the codec owns parsing).
+        """
         try:
             segments = raw_hl7.split("\r")
             msh = next((s for s in segments if s.startswith("MSH")), None)
             if not msh:
-                return None, None
+                return None
             field_sep = msh[3]
             fields = msh.split(field_sep)
-            control_id = fields[9] if len(fields) > 9 else None
-            return control_id, field_sep
+            return fields[9] if len(fields) > 9 else None
         except Exception:
-            return None, None
+            return None
 
     def _build_ack(self, control_id: str | None, ack_code: str) -> bytes:
         control_id = control_id or ""

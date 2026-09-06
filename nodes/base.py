@@ -39,6 +39,8 @@ class TransformNode(BaseNode):
 class DestinationNode(BaseNode):
     """Base class for all outbound message delivery protocols."""
     @abstractmethod
-    def send(self, payload: Any) -> Any:
-        """Dispatches the payload to the external destination."""
+    def send(self, message) -> Any:
+        """Delivers an already-serialized DestinationMessage (content is
+        str/bytes) to the external destination. Destinations must NOT perform
+        format serialization — the content they receive is final."""
         pass

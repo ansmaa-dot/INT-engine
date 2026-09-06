@@ -1,0 +1,761 @@
+{% macro field_input(prefix, f) %}
+{%- set fid = prefix ~ '__' ~ f.name -%}
+{%- set val = f.value if f.value is not none else f.default -%}
+{%- if f.ftype == 'checkbox' -%}
+<label class="cf-checkbox">
+  <input type="checkbox" name="{{ fid }}"{% if val|string in ('True','true','1','on') %} checked{% endif %}{% if f.required %} required{% endif %}>
+  {{ f.label }}
+</label>
+{%- elif f.ftype.startswith('select:') -%}
+<label class="cf-label">{{ f.label }}
+  <select name="{{ fid }}" class="cf-input"{% if f.required %} required{% endif %}>
+    {%- for o in f.ftype[7:].split(',') -%}
+    <option value="{{ o }}"{% if o == val|string %} selected{% endif %}>{{ o }}</option>
+    {%- endfor -%}
+  </select>
+</label>
+{%- elif f.ftype == 'textarea' -%}
+<label class="cf-label">{{ f.label }}
+  <textarea name="{{ fid }}" class="cf-input cf-ta" rows="3" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>{{ val }}</textarea>
+</label>
+{%- elif f.ftype == 'password' -%}
+{#- Never echo a stored secret back into the page. If a value already
+    exists, leave the input blank with a placeholder saying so; the backend
+    keeps the old value on save unless the user types a new one. -#}
+<label class="cf-label">{{ f.label }}
+  <input type="password" name="{{ fid }}" class="cf-input"
+         placeholder="{{ '•••••• (leave blank to keep unchanged)' if val else f.placeholder }}"
+         {% if f.required and not val %} required{% endif %}
+         autocomplete="new-password">
+</label>
+{%- else -%}
+<label class="cf-label">{{ f.label }}
+  <input type="{{ f.ftype }}" name="{{ fid }}" class="cf-input" value="{{ val }}" placeholder="{{ f.placeholder }}"{% if f.required %} required{% endif %}>
+</label>
+{%- endif -%}
+{% endmacro %}
+
+<form hx-post="/ui/channels/save" hx-target="#editor-container" hx-swap="innerHTML"
+      class="channel-form" id="channel-form" novalidate>
+
+{% if flash_errors %}
+<div class="cf-flash cf-flash-error" id="cf-flash">
+  <div class="cf-flash-inner">
+    <span class="cf-flash-icon">⚠️</span>
+    <div class="cf-flash-msg">
+      <strong>Validation Error{{ 's' if flash_errors|length > 1 else '' }}:</strong>
+      {% if flash_errors|length == 1 %}
+        {{ flash_errors[0] }}
+      {% else %}
+        <ul style="margin:4px 0 0;padding-left:18px;">{% for e in flash_errors %}<li>{{ e }}</li>{% endfor %}</ul>
+      {% endif %}
+    </div>
+    <button type="button" class="cf-flash-close" onclick="this.closest('.cf-flash').remove()" title="Dismiss">×</button>
+  </div>
+</div>
+{% endif %}
+{% if flash_success %}
+<div class="cf-flash cf-flash-success" id="cf-flash">
+  <div class="cf-flash-inner">
+    <span class="cf-flash-icon">✓</span>
+    <div class="cf-flash-msg">{{ flash_success }}</div>
+    <button type="button" class="cf-flash-close" onclick="this.closest('.cf-flash').remove()" title="Dismiss">×</button>
+  </div>
+</div>
+{% endif %}
+
+  {#- CSRF token: required if you adopt Flask-WTF. If you're not using
+      Flask-WTF, remove this line and the server-side validate_csrf() call
+      in save_channel(). -#}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <!-- Numbered stepper (replaces flow diagram + tab bar) -->
+  <div class="cf-stepper" id="cf-stepper">
+    <div class="cf-stepper-item active" data-step="0">
+      <div class="cf-stepper-num">1</div>
+      <div class="cf-stepper-label">Basic</div>
+      <div class="cf-stepper-sub">Identity</div>
+    </div>
+    <div class="cf-stepper-connector"></div>
+    <div class="cf-stepper-item" data-step="1">
+      <div class="cf-stepper-num">2</div>
+      <div class="cf-stepper-label">Source</div>
+      <div class="cf-stepper-sub">Transport &amp; Codec</div>
+    </div>
+    <div class="cf-stepper-connector"></div>
+    <div class="cf-stepper-item" data-step="2">
+      <div class="cf-stepper-num">3</div>
+      <div class="cf-stepper-label">Pipeline</div>
+      <div class="cf-stepper-sub">Steps &amp; Policy</div>
+    </div>
+    <div class="cf-stepper-connector"></div>
+    <div class="cf-stepper-item" data-step="3">
+      <div class="cf-stepper-num">4</div>
+      <div class="cf-stepper-label">Destination</div>
+      <div class="cf-stepper-sub">Outbound</div>
+    </div>
+  </div>
+
+  <!-- STEP 0: Basic -->
+  <div class="cf-step active" data-step="0">
+    <fieldset class="cf-section">
+      <legend>Identity &amp; Runtime</legend>
+      <div class="cf-row cols-2">
+        <label class="cf-label">Channel ID <span class="cf-req">*</span>
+          <input name="channel_id" class="cf-input" value="{{ config.channel_id }}" required
+                 {% if config.channel_id %}readonly style="background:#f1f5f9;color:#64748b;"{% endif %}>
+        </label>
+        <label class="cf-label">Name <span class="cf-req">*</span>
+          <input name="name" class="cf-input" value="{{ config.name }}" required>
+        </label>
+      </div>
+      <div class="cf-row cols-3">
+        <label class="cf-label">Status
+          <select name="status" class="cf-input">
+            <option value="running"{% if config.status=='running' %} selected{% endif %}>Running</option>
+            <option value="paused"{% if config.status=='paused' %} selected{% endif %}>Paused</option>
+          </select>
+        </label>
+        <label class="cf-label">Concurrency
+          <input type="number" name="concurrency" class="cf-input" min="1" max="16" value="{{ config.concurrency }}">
+        </label>
+        <label class="cf-checkbox" style="margin-top:22px;">
+          <input type="checkbox" name="enabled"{% if config.enabled %} checked{% endif %}> Enabled
+        </label>
+      </div>
+    </fieldset>
+  </div>
+
+  <!-- STEP 1: Source -->
+  <div class="cf-step" data-step="1">
+    <fieldset class="cf-section">
+      <legend>Inbound Transport</legend>
+      <div class="cf-row cols-2">
+        <label class="cf-label">Transport <span class="cf-req">*</span>
+          <select name="inbound_transport" id="transport-select" class="cf-input">
+            {% for t in transports %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="cf-label">Codec <span class="cf-req">*</span>
+          <select name="inbound_codec" class="cf-input">
+            {% for c in codecs %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}
+          </select>
+        </label>
+      </div>
+      {% if codec_shape_hint %}
+      <p class="cf-hint" style="color:var(--status-yellow);margin-top:6px;">⚠ {{ codec_shape_hint }}</p>
+      {% endif %}
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Connection</legend>
+      <p class="cf-hint">Fields shown depend on the transport selected above. Only the visible group is saved.</p>
+      <div id="transport-fields">
+        {% for tgroup in transport_groups %}
+        <div class="tc-group cf-card" data-transport="{{ tgroup.transport }}"
+             style="display:{{ 'block' if tgroup.visible else 'none' }};">
+          <div class="cf-card-title">{{ tgroup.transport_label }}</div>
+          <div class="cf-card-body cf-row cols-2">
+            {% for f in tgroup.fields %}{{ field_input('tc', f) }}{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Available Fields <small style="font-weight:400;text-transform:none;letter-spacing:0;">(with inbound codec hints)</small></legend>
+      <p class="cf-hint">Click a field chip to copy its canonical path. These are the fields your pipeline can read from, transform, and filter against.</p>
+      <input type="text" class="fields-search" placeholder="Filter fields\u2026" oninput="filterFieldChips(this.value)">
+      <div class="fields-panel" id="fields-panel">
+        {% if field_catalog %}
+          {% set groups = field_catalog|groupby('group') %}
+          {% for group, items in groups %}
+            <div class="fields-panel-group">{{ group }}</div>
+            {% for f in items %}
+              <span class="field-chip-chip" data-path="{{ f.path }}" data-label="{{ f.label }}" onclick="copyFieldPath(this)" title="Click to copy canonical path{% if f.hint %}&#10;Hint: {{ f.hint }}{% endif %}">
+                {{ f.label }}{% if f.hint %}<code>{{ f.hint }}</code>{% endif %}
+              </span>
+            {% endfor %}
+          {% endfor %}
+        {% else %}
+          <div class="fields-empty">Select an inbound codec above to see available fields.</div>
+        {% endif %}
+      </div>
+    </fieldset>
+  </div>
+
+  <!-- STEP 2: Pipeline -->
+  <div class="cf-step" data-step="2">
+    <p class="cf-help">Each step runs in order against the decoded message. Enrich steps retrieve reference data; transform, filter, and assert steps read the canonical fields shown under Available Fields in the Source tab.</p>
+
+    <fieldset class="cf-section">
+      <legend>Encoding</legend>
+      <label class="cf-label">Outbound Codec <span class="cf-req">*</span>
+        <select name="outbound_codec" class="cf-input">
+          {% for c in outbound_codecs %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Step Chain</legend>
+      <div class="step-chain" id="stepChain"></div>
+
+      <div class="add-step-row">
+        <div class="add-menu-wrap">
+          <button type="button" class="add-step-btn" onclick="Engine.UI.toggleMenu(event,'addStepMenu')">+ Add Step</button>
+          <div class="add-menu" id="addStepMenu">
+            <div class="add-menu-item" onclick="Engine.addStep('enrich');Engine.UI.closeMenu('addStepMenu')">
+              <span class="step-badge step-badge-enrich add-menu-badge">Enrich</span>
+              <div><div class="add-menu-title">Enrichment</div><div class="add-menu-desc">Retrieve reference data from a database</div></div>
+            </div>
+            <div class="add-menu-item" onclick="Engine.addStep('transform');Engine.UI.closeMenu('addStepMenu')">
+              <span class="step-badge step-badge-transform add-menu-badge">Map</span>
+              <div><div class="add-menu-title">Field Mapping</div><div class="add-menu-desc">Rename, reformat, or reshape fields</div></div>
+            </div>
+            <div class="add-menu-item" onclick="Engine.addStep('filter');Engine.UI.closeMenu('addStepMenu')">
+              <span class="step-badge step-badge-filter add-menu-badge">Filter</span>
+              <div><div class="add-menu-title">Filter</div><div class="add-menu-desc">Conditionally drop non-matching messages</div></div>
+            </div>
+            <div class="add-menu-item" onclick="Engine.addStep('assert');Engine.UI.closeMenu('addStepMenu')">
+              <span class="step-badge step-badge-assert add-menu-badge">Check</span>
+              <div><div class="add-menu-title">Validation</div><div class="add-menu-desc">Reject messages that fail a condition</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Policies</legend>
+      <label class="cf-label">Retry Policy <span class="cf-req">*</span>
+        <select name="retry_policy_id" class="cf-input">
+          {% for r in retry_policies %}<option value="{{ r.value }}"{% if r.selected %} selected{% endif %}>{{ r.label }}</option>{% endfor %}
+        </select>
+      </label>
+    </fieldset>
+
+    <!-- Hidden field: the pipeline JSON is assembled by JS and stored here -->
+    <input type="hidden" name="pipeline" id="pipeline_field" value="{{ pipeline_json }}">
+  </div>
+
+  <!-- STEP 3: Destination -->
+  <div class="cf-step" data-step="3">
+    <fieldset class="cf-section">
+      <legend>Outbound Destination</legend>
+      <label class="cf-label">Destination <span class="cf-req">*</span>
+        <select name="destination" id="destination-select" class="cf-input">
+          {% for d in destinations %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset class="cf-section">
+      <legend>Connection</legend>
+      <p class="cf-hint">Fields shown depend on the destination selected above. Only the visible group is saved.</p>
+      <div id="destination-fields">
+        {% for dgroup in dest_groups %}
+        <div class="dc-group cf-card" data-destination="{{ dgroup.destination }}"
+             style="display:{{ 'block' if dgroup.visible else 'none' }};">
+          <div class="cf-card-title">{{ dgroup.dest_label }}</div>
+          <div class="cf-card-body cf-row cols-2">
+            {% for f in dgroup.fields %}{{ field_input('dc', f) }}{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </fieldset>
+  </div>
+
+  <input type="hidden" name="is_edit" value="{{ 'true' if config.channel_id else 'false' }}">
+  <input type="hidden" name="wizard_step" id="wizard_step" value="{{ initial_step or 0 }}">
+
+  <div class="cf-actions">
+    <button type="button" class="btn" id="cf-prev" onclick="step(-1)" style="display:none;">&#8592; Back</button>
+    <div style="flex:1;"></div>
+    <button type="button" class="btn btn-primary" id="cf-next" onclick="step(1)">Next &#8594;</button>
+    <button type="submit" class="btn btn-primary" id="cf-save" style="display:none;">Save Channel</button>
+    <button type="button" class="btn" onclick="switchTab('dashboard')">Cancel</button>
+  </div>
+
+</form>
+
+
+<script>
+(function(){
+var f=document.getElementById('channel-form'); if(!f)return;
+var steps=f.querySelectorAll('.cf-step');
+var stepperItems=f.querySelectorAll('.cf-stepper-item');
+var connectors=f.querySelectorAll('.cf-stepper-connector');
+var prev=f.querySelector('#cf-prev'), next=f.querySelector('#cf-next'), save=f.querySelector('#cf-save');
+var wizardStepInput=f.querySelector('#wizard_step');
+var total=steps.length, current=0;
+
+/* ---- Stepper ---- */
+function renderStepper(){
+  steps.forEach(function(s,i){ s.classList.toggle('active', i===current); });
+  stepperItems.forEach(function(it,i){
+    it.classList.toggle('active', i===current);
+    it.classList.toggle('done', i<current);
+    it.querySelector('.cf-stepper-num').textContent = i<current ? '\u2713' : (i+1);
+  });
+  connectors.forEach(function(c,i){ c.classList.toggle('done', i<current); });
+  prev.style.display=current===0?'none':'';
+  next.style.display=current===total-1?'none':'';
+  save.style.display=current===total-1?'':'none';
+  wizardStepInput.value=current;
+}
+window.step=function(d){
+  if(d>0){ var bad=steps[current].querySelector(':invalid'); if(bad){ bad.reportValidity(); return; } }
+  var nextIdx=current+d;
+  if(nextIdx<0||nextIdx>=total)return;
+  current=nextIdx;
+  renderStepper();
+};
+stepperItems.forEach(function(it,idx){
+  it.addEventListener('click', function(){
+    if(idx===current) return;
+    if(idx>current){ var bad=steps[current].querySelector(':invalid'); if(bad){ bad.reportValidity(); return; } }
+    current=idx; renderStepper();
+  });
+});
+f.addEventListener('invalid', function(e){
+  var stepEl = e.target.closest('.cf-step');
+  if(!stepEl) return;
+  var idx = parseInt(stepEl.getAttribute('data-step'), 10);
+  if(idx !== current){ current=idx; renderStepper(); }
+}, true);
+var initStep = parseInt(wizardStepInput.value || '0', 10);
+if (initStep > 0 && initStep < total) { current = initStep; }
+
+/* ---- Step-chain Engine ---- */
+var STEP_TYPES = {{ step_type_meta|tojson }};
+var TRANSFORM_FNS = {{ transform_fns|tojson }};
+var pipeline = [];
+var stepIdCounter = 0;
+function nextStepId(type){ stepIdCounter++; return 's' + stepIdCounter + '_' + type; }
+
+/* Escape a value for embedding into an HTML attribute (rule source/target,
+   function args) so user-supplied config can never break out of the markup. */
+function escAttr(s){
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+/* Build the whitelisted-function <select> for one Map rule.
+   '' = "none" -> the rule does a plain source->target copy. */
+function fnSelectHtml(selected){
+  var opts = ['<option value="">(none)</option>'];
+  (TRANSFORM_FNS || []).forEach(function(fn){
+    opts.push('<option value="' + fn + '"' + (selected === fn ? ' selected' : '') + '>' + fn + '</option>');
+  });
+  return '<select class="cf-input rule-fn" onchange="Engine.ruleFnChanged(this)" style="min-width:150px;">' + opts.join('') + '</select>';
+}
+/* Render the per-function Args control for one Map rule.
+   Format -> free-text strftime format; Default -> free-text fallback value;
+   other functions -> no args (dash). Anything previously saved that doesn't
+   fit those two falls back to a generic JSON box so nothing is dropped. */
+function fnArgsCellHtml(rule){
+  var fn = rule && rule.fn ? rule.fn : '';
+  var args = rule ? rule.fn_args : undefined;
+  var parsedObj = null, rawStr = null;
+  if(typeof args === 'object' && args !== null && !Array.isArray(args)) parsedObj = args;
+  else if(typeof args === 'string'){
+    rawStr = args;
+    try{ var p = JSON.parse(args); if(p && typeof p === 'object' && !Array.isArray(p)) parsedObj = p; }catch(e){}
+  }
+  var style = 'style="min-width:170px;"';
+  if(fn === 'Format'){
+    var fmt = (parsedObj && parsedObj.fmt != null) ? String(parsedObj.fmt) : '';
+    return '<input class="cf-input rule-arg-value" value="' + escAttr(fmt) + '" placeholder="%Y%m%d%H%M%S" ' + style + ' title="strftime output format (default %Y%m%d%H%M%S)" onchange="Engine.stepChanged()">';
+  }
+  if(fn === 'Default'){
+    var dv = (parsedObj && parsedObj.default != null) ? String(parsedObj.default) : '';
+    return '<input class="cf-input rule-arg-value" value="' + escAttr(dv) + '" placeholder="value when source missing" ' + style + ' title="Fallback value used when the source field is empty or missing" onchange="Engine.stepChanged()">';
+  }
+  if(parsedObj || rawStr){
+    var val = parsedObj ? JSON.stringify(parsedObj) : rawStr;
+    return '<input class="cf-input rule-arg-raw" value="' + escAttr(val) + '" placeholder="{}" ' + style + ' onchange="Engine.stepChanged()">';
+  }
+  return '<span class="cf-hint" style="padding:4px 2px;display:inline-block;">—</span>';
+}
+
+function assemblePipeline(){
+  var arr = [];
+  var cards = document.querySelectorAll('#stepChain .step-card');
+  cards.forEach(function(card){
+    var sid = card.getAttribute('data-sid');
+    var step = pipeline.find(function(s){ return s.sid === sid; });
+    if(step){ var obj = readStepConfig(card, step); if(obj) arr.push(obj); }
+  });
+  var field = document.getElementById('pipeline_field');
+  if(field) field.value = JSON.stringify(arr);
+  cards.forEach(function(card){
+    var sid = card.getAttribute('data-sid');
+    var step = pipeline.find(function(s){ return s.sid === sid; });
+    if(step) updateSummary(card, step);
+  });
+}
+
+function makeStep(type, data){
+  var meta = STEP_TYPES[type] || {};
+  var sid = (data && data.sid) || nextStepId(type);
+  return {
+    sid: sid, type: type, label: meta.label || type,
+    step_id: (data && data.step_id) || sid,
+    rules: (data && data.rules) || (type === 'transform' ? [] : undefined),
+    db_type: (data && data.db_type) || 'sqlite',
+    db_path: (data && data.db_path) || '',
+    connection_string: (data && data.connection_string) || '',
+    source_key_field: (data && data.source_key_field) || '',
+    lookup_name: (data && data.lookup_name) || '',
+    target_table: (data && data.target_table) || '',
+    target_key_col: (data && data.target_key_col) || '',
+    fields: (data && data.fields) || [],
+    field: (data && data.field) || '',
+    op: (data && data.op) || '==',
+    value: (data && data.value) || '',
+    on_fail: (data && data.on_fail) || ((type === 'filter') ? 'dead_letter' : (type === 'assert' ? 'retry' : '')),
+  };
+}
+
+function updateSummary(card, step){
+  var el = card.querySelector('.step-summary');
+  if(!el) return;
+  var s = '';
+  if(step.type === 'transform') s = (step.rules||[]).length + ' rule' + ((step.rules||[]).length !== 1 ? 's' : '');
+  else if(step.type === 'enrich') s = 'Lookup ' + (step.lookup_name || 'unnamed') + (step.target_table ? ' in ' + step.target_table : '');
+  else if(step.type === 'filter') s = 'If ' + (step.field||'field') + ' ' + (step.op||'==') + ' \u2026 \u2192 ' + (step.on_fail==='discard'?'discard':'dead-letter');
+  else if(step.type === 'assert') s = 'Assert ' + (step.field||'field') + ' \u2192 ' + (step.on_fail==='retry'?'retry':'dead-letter');
+  el.textContent = s;
+  var titleEl = card.querySelector('.step-title');
+  if(titleEl) titleEl.textContent = step.step_id || step.sid;
+}
+
+function readStepConfig(card, step){
+  var st = step.type;
+  var si = card.querySelector('.step-id-input');
+  if(si) step.step_id = si.value.trim() || step.sid;
+  if(st === 'transform'){
+    var rcs = card.querySelectorAll('.mapping-rule');
+    step.rules = [];
+    rcs.forEach(function(rc){
+      var src = (rc.querySelector('.rule-source')||{}).value || '';
+      var tgt = (rc.querySelector('.rule-target')||{}).value || '';
+      var fnName = ((rc.querySelector('.rule-fn')||{}).value || '').trim();
+      var rule = {source: src, target: tgt};
+      if(fnName) rule.fn = fnName;
+      var argInput = rc.querySelector('.rule-arg-value, .rule-arg-raw');
+      if(argInput){
+        var val = argInput.value.trim();
+        if(val){
+          // Friendly builders: Format takes a format string, Default a value.
+          if(fnName === 'Format') rule.fn_args = {fmt: val};
+          else if(fnName === 'Default') rule.fn_args = {default: val};
+          else {
+            // Fallback path: existing rules with arbitrary JSON args.
+            var parsed = null;
+            try { parsed = JSON.parse(val); } catch(err) { parsed = null; }
+            if(parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rule.fn_args = parsed;
+            else rule.fn_args = val;
+          }
+        }
+      }
+      if(src || tgt || fnName) step.rules.push(rule);
+    });
+  } else if(st === 'enrich'){
+    step.db_type = (card.querySelector('.enrich-db-type')||{}).value || 'sqlite';
+    step.db_path = (card.querySelector('.enrich-db-path')||{}).value || '';
+    step.source_key_field = (card.querySelector('.enrich-source-key')||{}).value || '';
+    step.lookup_name = (card.querySelector('.enrich-lookup-name')||{}).value || '';
+    step.target_table = (card.querySelector('.enrich-table')||{}).value || '';
+    step.target_key_col = (card.querySelector('.enrich-key-col')||{}).value || '';
+    var chips = card.querySelectorAll('.enrich-field-chip');
+    step.fields = Array.from(chips).map(function(c){ return c.textContent.replace(/[\u00d7]/g,'').trim(); });
+  } else if(st === 'filter' || st === 'assert'){
+    step.field = (card.querySelector('.expr-field')||{}).value || '';
+    step.op = (card.querySelector('.expr-op')||{}).value || '==';
+    step.value = (card.querySelector('.expr-value')||{}).value || '';
+    step.on_fail = (card.querySelector('.on-fail-select')||{}).value || '';
+  }
+  var obj = { step_id: step.step_id, type: step.type };
+  if(st === 'transform') obj.config = { rules: step.rules };
+  else if(st === 'enrich'){
+    obj.config = { db_type: step.db_type, db_path: step.db_path || null, connection_string: step.connection_string || null,
+      source_key_field: step.source_key_field, lookup_name: step.lookup_name,
+      target_table: step.target_table, target_key_col: step.target_key_col, fields: step.fields };
+  } else if(st === 'filter' || st === 'assert'){
+    if(step.field && step.op && step.value !== ''){
+      var v = step.value;
+      if(v === 'true') v = true; else if(v === 'false') v = false;
+      else if(!isNaN(v) && v.trim() !== '') v = Number(v);
+      obj.config = { expression: { var: step.field, op: step.op, value: v }, on_fail: step.on_fail };
+    } else { obj.config = { expression: {}, on_fail: step.on_fail }; }
+  }
+  return obj;
+}
+
+function readPipelineFromField(){
+  var field = document.getElementById('pipeline_field');
+  var raw = field ? field.value : '';
+  if(!raw) return [];
+  try { return JSON.parse(raw); } catch(e){ return []; }
+}
+
+function hydratePipeline(){
+  var items = readPipelineFromField();
+  pipeline = []; stepIdCounter = 0;
+  items.forEach(function(item, idx){
+    var type = item.type, cfg = item.config || {}, step;
+    if(type === 'transform') step = makeStep(type, {sid:'s'+(idx+1)+'_'+type, step_id:item.step_id, rules:cfg.rules||[]});
+    else if(type === 'enrich') step = makeStep(type, Object.assign({sid:'s'+(idx+1)+'_'+type, step_id:item.step_id}, cfg));
+    else if(type === 'filter' || type === 'assert'){
+      var expr = cfg.expression || {};
+      step = makeStep(type, {sid:'s'+(idx+1)+'_'+type, step_id:item.step_id,
+        field:expr['var']||'', op:expr.op||'==', value:expr.value !== undefined ? String(expr.value):'', on_fail:cfg.on_fail||''});
+    } else step = makeStep(type, {sid:'s'+(idx+1)+'_'+type, step_id:item.step_id});
+    pipeline.push(step);
+  });
+  stepIdCounter = pipeline.length || 0;
+}
+
+window.Engine = {
+  addStep: function(type){ var step = makeStep(type); pipeline.push(step); renderAllSteps(); assemblePipeline(); },
+  removeStep: function(sid){ pipeline = pipeline.filter(function(s){ return s.sid !== sid; }); renderAllSteps(); assemblePipeline(); },
+  moveUp: function(sid){
+    var idx = pipeline.findIndex(function(s){ return s.sid === sid; });
+    if(idx <= 0) return; var tmp = pipeline[idx-1]; pipeline[idx-1] = pipeline[idx]; pipeline[idx] = tmp;
+    renderAllSteps(); assemblePipeline();
+  },
+  moveDown: function(sid){
+    var idx = pipeline.findIndex(function(s){ return s.sid === sid; });
+    if(idx < 0 || idx >= pipeline.length - 1) return;
+    var tmp = pipeline[idx+1]; pipeline[idx+1] = pipeline[idx]; pipeline[idx] = tmp;
+    renderAllSteps(); assemblePipeline();
+  },
+  UI: {
+    toggleMenu: function(evt, menuId){
+      evt.stopPropagation();
+      document.querySelectorAll('.add-menu').forEach(function(m){ if(m.id !== menuId) m.classList.remove('open'); });
+      document.getElementById(menuId).classList.toggle('open');
+    },
+    closeMenu: function(menuId){ document.getElementById(menuId).classList.remove('open'); },
+    toggleCard: function(headEl){ headEl.closest('.step-card').classList.toggle('open'); },
+    /* Re-render a rule's Args cell when its Function dropdown changes. */
+    ruleFnChanged: function(sel){
+      var tr = sel.closest ? sel.closest('tr') : null;
+      if(tr){
+        var cell = tr.querySelector('.rule-args-cell');
+        if(cell) cell.innerHTML = fnArgsCellHtml({fn: sel.value});
+      }
+      assemblePipeline();
+    }
+  },
+  stepChanged: function(){ assemblePipeline(); }
+};
+
+/* ---- Event delegation for dynamically-generated elements ---- */
+var stepChain = document.getElementById('stepChain');
+if(stepChain){
+  stepChain.addEventListener('click', function(e){
+    var target = e.target;
+    var action = target.getAttribute('data-action') || (target.closest && target.closest('[data-action]')||{}).getAttribute ? (target.closest('[data-action]')||{}).getAttribute('data-action') : null;
+    if(!action){
+      // Try closest parent
+      var el = target.closest ? target.closest('[data-action]') : null;
+      if(el) action = el.getAttribute('data-action');
+    }
+    if(!action) return;
+    var el = target.closest ? target.closest('[data-action]') : target;
+    var sid = el.getAttribute('data-sid');
+    var menuId = el.getAttribute('data-menu');
+
+    if(action === 'add-rule'){
+      var table = el.previousElementSibling;
+      if(!table) table = el.parentElement.querySelector('table.mapping-table');
+      if(table){
+        var tbody = table.querySelector('tbody');
+        var tr = document.createElement('tr');
+        tr.className = 'mapping-rule';
+        tr.innerHTML = '<td><input class="cf-input rule-source" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td class="mt-arrow">&rarr;</td><td><input class="cf-input rule-target" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td>' + fnSelectHtml('') + '</td><td class="rule-args-cell">' + fnArgsCellHtml({}) + '</td><td><button type="button" class="mt-remove" data-action="remove-rule">&times;</button></td>';
+        tbody.appendChild(tr);
+        Engine.stepChanged();
+      }
+    } else if(action === 'remove-rule'){
+      var tr = target.closest('tr');
+      if(tr){ tr.remove(); Engine.stepChanged(); }
+    } else if(action === 'remove-chip'){
+      target.closest('.field-chip').remove();
+      Engine.stepChanged();
+    } else if(action === 'card-menu'){
+      e.stopPropagation();
+      var id = target.closest('[data-menu]').getAttribute('data-menu');
+      if(id) Engine.UI.toggleMenu(e, id);
+    } else if(action === 'move-up'){
+      Engine.moveUp(sid); if(menuId) Engine.UI.closeMenu(menuId);
+    } else if(action === 'move-down'){
+      Engine.moveDown(sid); if(menuId) Engine.UI.closeMenu(menuId);
+    } else if(action === 'remove-step'){
+      Engine.removeStep(sid); if(menuId) Engine.UI.closeMenu(menuId);
+    }
+  });
+
+  stepChain.addEventListener('keydown', function(e){
+    if(e.key === 'Enter' && e.target.classList.contains('enrich-field-input')){
+      e.preventDefault();
+      var v = e.target.value.trim();
+      if(v){
+        var sid = e.target.getAttribute('data-sid');
+        var wrap = e.target.closest('.section-body').querySelector('.enrich-fields-wrap');
+        if(wrap) wrap.insertAdjacentHTML('beforeend', enrichFieldChip(v));
+        e.target.value = '';
+        Engine.stepChanged();
+      }
+    }
+  });
+}
+
+var _cardMenuId = 0;
+function cardMenuId(){ _cardMenuId++; return 'cardMenu' + _cardMenuId; }
+
+function enrichFieldChip(label){
+  return '<span class="field-chip enrich-field-chip">' + label + '<button type="button" class="mt-remove" data-action="remove-chip" title="Remove">&times;</button></span>';
+}
+
+function makeStepCardHTML(step, idx){
+  var meta = STEP_TYPES[step.type] || {};
+  var bc = 'step-badge-' + step.type;
+  var mid = cardMenuId();
+  var sid = step.sid;
+  var body = '';
+
+  if(step.type === 'transform'){
+    body = '<table class="mapping-table"><thead><tr><th>Source Field</th><th></th><th>Target Field</th><th>Function</th><th>Args</th><th></th></tr></thead><tbody>';
+    (step.rules||[]).forEach(function(rule){
+      body += '<tr class="mapping-rule"><td><input class="cf-input rule-source" value="' + escAttr(rule.source) + '" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td class="mt-arrow">&rarr;</td><td><input class="cf-input rule-target" value="' + escAttr(rule.target) + '" placeholder="patient.name" onchange="Engine.stepChanged()"></td><td>' + fnSelectHtml(rule.fn||'') + '</td><td class="rule-args-cell">' + fnArgsCellHtml(rule) + '</td><td><button type="button" class="mt-remove" data-action="remove-rule">&times;</button></td></tr>';
+    });
+    body += '</tbody></table>';
+    body += '<div class="mt-add-row" data-action="add-rule">+ Add Mapping Rule</div>';
+  } else if(step.type === 'enrich'){
+    body = '<div class="cf-row cols-2" style="padding:0 0 10px!important;"><label class="cf-label">Data Source<select class="cf-input enrich-db-type" onchange="Engine.stepChanged()"><option value="sqlite"' + (step.db_type==='sqlite'?' selected':'') + '>SQLite</option><option value="postgresql"' + (step.db_type==='postgresql'?' selected':'') + '>PostgreSQL</option><option value="mysql"' + (step.db_type==='mysql'?' selected':'') + '>MySQL</option></select></label><label class="cf-label">DB Path / Conn String<input class="cf-input enrich-db-path" value="' + (step.db_path||step.connection_string||'') + '" placeholder="/path/to/db" onchange="Engine.stepChanged()"></label></div>';
+    body += '<div class="cf-row cols-2" style="padding:0 0 10px!important;"><label class="cf-label">Source Key Field<input class="cf-input enrich-source-key" value="' + (step.source_key_field||'') + '" placeholder="mrn" onchange="Engine.stepChanged()"></label><label class="cf-label">Lookup Name<input class="cf-input enrich-lookup-name" value="' + (step.lookup_name||'') + '" placeholder="patient_ref" onchange="Engine.stepChanged()"></label></div>';
+    body += '<div class="cf-row cols-2" style="padding:0 0 10px!important;"><label class="cf-label">Target Table<input class="cf-input enrich-table" value="' + (step.target_table||'') + '" placeholder="patients" onchange="Engine.stepChanged()"></label><label class="cf-label">Target Key Column<input class="cf-input enrich-key-col" value="' + (step.target_key_col||'') + '" placeholder="mrn" onchange="Engine.stepChanged()"></label></div>';
+    body += '<label class="cf-label">Retrieved Fields</label><div style="margin-top:4px;" class="enrich-fields-wrap" data-sid="' + sid + '">';
+    (step.fields||[]).forEach(function(fld){ body += enrichFieldChip(fld); });
+    body += '</div><div style="margin-top:6px;"><input class="cf-input enrich-field-input" data-sid="' + sid + '" placeholder="Type field name and press Enter" style="width:200px;display:inline;"></div>';
+    body += '<div class="note-row">If no match is found, the retrieved fields remain empty for this message.</div>';
+  } else if(step.type === 'filter' || step.type === 'assert'){
+    var ops = [['==','equals'],['!=','not equals'],['>','greater than'],['<','less than'],['>=','greater or equal'],['<=','less or equal'],['in','in list (comma-sep)']];
+    var oo = ops.map(function(o){ return '<option value="'+o[0]+'"'+(step.op===o[0]?' selected':'')+'>'+o[1]+'</option>'; }).join('');
+    var fo = (meta.on_fail_options||[]).map(function(o){ return '<option value="'+o.value+'"'+(step.on_fail===o.value?' selected':'')+'>'+o.label+'</option>'; }).join('');
+    body = '<div class="expr-row" style="padding:0 0 4px!important;"><label class="cf-label">Field<input class="cf-input expr-field" value="' + (step.field||'') + '" placeholder="patient.name" onchange="Engine.stepChanged()"></label><label class="cf-label">Condition<select class="cf-input expr-op" onchange="Engine.stepChanged()">' + oo + '</select></label><label class="cf-label">Value<input class="cf-input expr-value" value="' + (step.value||'') + '" placeholder="routine" onchange="Engine.stepChanged()"></label></div>';
+    body += '<div style="padding:0 0 0!important;"><label class="cf-label" style="max-width:220px;">On Failure<select class="cf-input on-fail-select" onchange="Engine.stepChanged()">' + fo + '</select></label></div>';
+  }
+
+  var sum = '';
+  if(step.type === 'transform') sum = (step.rules||[]).length + ' rule' + ((step.rules||[]).length !== 1 ? 's' : '');
+  else if(step.type === 'enrich') sum = 'Lookup ' + (step.lookup_name||'unnamed') + (step.target_table ? ' in ' + step.target_table : '');
+  else if(step.type === 'filter') sum = 'If ' + (step.field||'field') + ' ' + (step.op||'==') + ' \u2026 \u2192 ' + (step.on_fail==='discard'?'discard':'dead-letter');
+  else if(step.type === 'assert') sum = 'Assert ' + (step.field||'field') + ' \u2192 ' + (step.on_fail==='retry'?'retry':'dead-letter');
+
+  return '<div class="step-card section-box open" data-sid="' + sid + '">'
+    + '<div class="section-header-row" onclick="Engine.UI.toggleCard(this)" style="cursor:pointer;">'
+    + '<div>'
+    + '<span class="step-badge ' + bc + '">' + (meta.label||step.type) + '</span>'
+    + '<span class="step-title-block">'
+    + '<span class="step-title">' + (step.step_id||step.sid) + '</span>'
+    + '<div class="step-summary">' + sum + '</div>'
+    + '</span>'
+    + '</div>'
+    + '<div class="step-head-right">'
+    + '<span class="step-scope">Channel-Specific</span>'
+    + '<div class="add-menu-wrap" style="display:inline-block;">'
+    + '<button type="button" class="step-menu-btn" data-action="card-menu" data-menu="' + mid + '" title="Step actions">&vellip;</button>'
+    + '<div class="add-menu" id="' + mid + '" style="left:auto;right:0;transform:none;">'
+    + '<div class="add-menu-item" data-action="move-up" data-sid="' + sid + '" data-menu="' + mid + '"><div class="add-menu-title">&uarr; Move Up</div></div>'
+    + '<div class="add-menu-item" data-action="move-down" data-sid="' + sid + '" data-menu="' + mid + '"><div class="add-menu-title">&darr; Move Down</div></div>'
+    + '<div class="add-menu-item" data-action="remove-step" data-sid="' + sid + '" data-menu="' + mid + '"><div class="add-menu-title" style="color:var(--status-red);">Remove Step</div></div>'
+    + '</div>'
+    + '</div>'
+    + '<span class="step-chevron">&blacktriangleright;</span>'
+    + '</div>'
+    + '</div>'
+    + '<div class="section-body">'
+    + '<div style="margin-bottom:6px;"><label class="cf-label">Step ID<input class="cf-input step-id-input" value="' + (step.step_id||step.sid) + '" onchange="Engine.stepChanged()" style="max-width:260px;"></label></div>'
+    + body
+    + '</div>'
+    + '</div>';
+}
+
+function renderAllSteps(){
+  var chain = document.getElementById('stepChain');
+  if(!chain) return;
+  chain.innerHTML = pipeline.map(function(s, i){ return makeStepCardHTML(s, i); }).join('');
+}
+
+document.addEventListener('click', function(e){
+  if(!e.target.closest('.add-menu-wrap')){
+    document.querySelectorAll('.add-menu').forEach(function(m){ m.classList.remove('open'); });
+  }
+});
+
+/* ---- Field chip filter ---- */
+window.filterFieldChips = function(query){
+  var panel = document.getElementById('fields-panel');
+  if(!panel) return;
+  var q = (query||'').toLowerCase();
+  panel.querySelectorAll('.field-chip-chip').forEach(function(chip){
+    var label = (chip.getAttribute('data-label')||'').toLowerCase();
+    var path = (chip.getAttribute('data-path')||'').toLowerCase();
+    chip.style.display = (!q || label.indexOf(q)>=0 || path.indexOf(q)>=0) ? '' : 'none';
+  });
+  panel.querySelectorAll('.fields-panel-group').forEach(function(g){
+    var vis = false, el = g.nextElementSibling;
+    while(el && el.classList.contains('field-chip-chip')){
+      if(el.style.display !== 'none') vis = true;
+      el = el.nextElementSibling;
+    }
+    g.style.display = vis ? '' : 'none';
+  });
+};
+
+window.copyFieldPath = function(el){
+  var path = el.getAttribute('data-path');
+  if(!path) return;
+  if(navigator.clipboard){
+    navigator.clipboard.writeText(path).then(function(){
+      el.style.borderColor = 'var(--status-green)';
+      setTimeout(function(){ el.style.borderColor = ''; }, 800);
+    });
+  }
+};
+
+/* ---- Transport / destination toggle ---- */
+var ts=f.querySelector('#transport-select'), ds=f.querySelector('#destination-select');
+function tg(s,g,a){
+  g.forEach(function(x){
+    var show = x.getAttribute('data-'+a)===s.value;
+    x.style.display = show ? 'block' : 'none';
+    x.querySelectorAll('input,select,textarea').forEach(function(el){ el.disabled = !show; });
+  });
+}
+if(ts){
+  var tgA=Array.from(f.querySelectorAll('.tc-group'));
+  tg(ts, tgA, 'transport');
+  ts.addEventListener('change', function(){ tg(ts, tgA, 'transport'); });
+}
+if(ds){
+  var dgA=Array.from(f.querySelectorAll('.dc-group'));
+  tg(ds, dgA, 'destination');
+  ds.addEventListener('change', function(){ tg(ds, dgA, 'destination'); });
+}
+
+/* ---- Flash ---- */
+var flash=document.getElementById('cf-flash');
+if(flash){setTimeout(function(){flash.style.transition='opacity 0.4s';flash.style.opacity='0';setTimeout(function(){flash.remove()},400)},8000);}
+
+/* ---- Init ---- */
+hydratePipeline();
+renderAllSteps();
+renderStepper();
+})();
+</script>
