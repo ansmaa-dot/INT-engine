@@ -1,11 +1,13 @@
 # INT-engine
 
-Integration engine: JSON-configured channels (Ingestion → Enrichment → Transform → Destination), a Flask + HTMX admin dashboard, and a background worker daemon. Sync/thread-based throughout (no asyncio) — SQLite-backed queue, atomic multi-worker-safe dequeue, one or more worker threads per channel.
+An integration / interface engine for health and lab messaging written in Python. **Channels** are declared in SQLite and edited via the web UI (no JSON config files) — each is an inbound transport + codec, an ordered step chain (`decode → validate → [enrich | transform | filter | assert]* → validate → encode → deliver`), an outbound codec, and a destination, all piped through a single transport-independent **canonical message model**. Pluggable **codecs** normalize wire formats (HL7 v2.5.1, FHIR R4, JSON) to and from that model. Sync/thread-based throughout (no asyncio) — SQLite-backed queue, atomic multi-worker-safe dequeue, a background worker daemon, and a Flask + HTMX control plane.
+
+> **Deep dive:** [`ARCHITECTURE.md`](ARCHITECTURE.md) is the current, authoritative reference (pipeline details, codecs, schema, reliability). This README is the quick start.
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt   # flask, requests
+pip install -r requirements.txt   # flask, requests, SQLAlchemy, paramiko, pydantic, pytest
 cp config/auth_profiles.json.example config/auth_profiles.json  # already done; edit with real secrets
 ```
 
@@ -30,24 +32,21 @@ The main control-plane dashboard — live channel health, queue metrics, and the
 
 ## Architecture
 
-- **Case 1 — Ingestion**:
-  - `/api/ingest/<channel_id>` — manual/generic POST, always available regardless of a channel's configured protocol.
-  - `nodes/ingestion/http_poller.py` — pull, runs in the worker daemon.
-  - `nodes/ingestion/http_webhook.py` — push, registered onto the Flask app, optional HMAC signature verification.
-  - `nodes/ingestion/mllp_server.py` — raw MLLP/TCP listener for HL7. Enqueues before ACKing (so a crash between the two never loses a message the sender believes was delivered), NACKs (AE) instead of accepting new messages once a channel's queue depth crosses its configured limit.
-  - `nodes/ingestion/file_watcher.py` — polls a directory for `.csv`/`.hl7`/`.txt` files, claims each via an atomic rename to `.processing` before reading (so a crash mid-read doesn't silently drop or double-process it), moves finished files to `processed/` or `failed/`.
-  - `nodes/ingestion/db_poller.py` — polls a database (SQLite/PostgreSQL/MySQL via SQLAlchemy) on an interval and enqueues each row. Supports cursor-based incremental pulls via `cursor_field`/`cursor_param`.
-- **Case 2 — Enrichment**: `nodes/enrichment/batch_lookup.py`. Optional per channel — configure `enrichment_config` in the channel editor and reference results in mapping rules as `lookups.<lookup_name>.<field>`.
-- **Case 3 — Transform**: `nodes/transform/field_mapper.py` + `nodes/transform/functions.py` (whitelisted functions only: Uppercase, Lowercase, Trim Whitespace, Format, Default — no eval, no dynamic scripting).
-- **Case 4 — Destination**: `nodes/destination/http_client.py` (auth-aware, retries once on 401 with a fresh token), `nodes/destination/mllp_client.py`, and `nodes/destination/sftp_client.py` (uploads each payload as a file via SFTP, supports password or private-key auth).
-- **Auth**: `core/auth_manager.py` — api_key, basic, bearer_static, oauth2_client_credentials with cached/locked token refresh. Shared by ingestion pollers, webhooks (signature secret is separate), and destinations.
-- **Control plane**: `api/app.py` (Flask + HTMX dashboard, admin API, `/health`, per-channel and per-entry DLQ requeue/discard, message audit-trail lookup by trace_id), `engine/main.py` (worker daemon, ingestion lifecycle, stale-claim reclaim loop), `engine/config_loader.py` (SQLite-backed channel config with live schema migration).
+- **Canonical pipeline** (`engine/runner.py`, `ChannelRunner`) — every message flows `dequeue → decode → validate → step chain → validate → encode → deliver`, one message at a time. Only a `CanonicalMessage` crosses stage boundaries (`core/model/base.py`); raw wire text is kept for audit/debug, never used as the pipeline's working currency.
+- **Step chain** (`engine/steps.py`) — a channel's `pipeline` is an ordered list of typed steps: `enrich` (read-only `BatchLookup`), `transform` (pure `FieldMapper`), `filter` (boolean expression → `dead_letter` / `discard`), and `assert` (boolean expression → `retry` / `dead_letter`). Reusable steps live in the Definitions UI.
+- **Codecs** (`nodes/codec/`) — pluggable and **exact-match** (an unknown key raises; no implicit passthrough fallback). Keys: `json` (strict canonical), `schemaless.json` (arbitrary/dot-key JSON), `passthrough` (raw text), `hl7v2.5.1.ORU_R01` / `hl7v2.5.1.ADT_A01`, and `fhir.r4` — see [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.
+- **Ingestion** (`nodes/ingestion/`) — format-agnostic transports that only frame raw content (parsing is the codec's job): `http_webhook` (Flask, optional HMAC), `mllp_server` (raw TCP, enqueue-before-ACK, NACKs `AE` at capacity), `http_poller` (interval GET), `file_watcher` (atomic `.processing` claim per file), `db_poller` (SQLAlchemy, cursor-based incremental).
+- **Enrichment** — `nodes/enrichment/batch_lookup.py`; optional read-only DB lookup, referenced in mappings as `lookups.<lookup_name>.<field>`.
+- **Transform** — `nodes/transform/field_mapper.py` + whitelisted functions only (Uppercase, Lowercase, Trim Whitespace, Format, Default — no eval, no dynamic scripting).
+- **Destination** — `nodes/destination/`: `http_client` (auth-aware, retries once on 401 with a fresh token), `mllp_client`, `sftp_client` (file upload; password or private-key auth).
+- **Auth** — `core/auth_manager.py`: api_key, basic, bearer_static, oauth2_client_credentials with cached/locked token refresh. Shared by ingestion and destinations (webhook signature secret is separate).
+- **Control plane** (`api/app.py` → blueprints in `api/ui/`) — Flask + HTMX dashboard: channel control (metrics, per-channel enable/disable), engine inspector (DLQ requeue/discard, message audit-trail lookup by trace_id), tabbed channel editor (Basic → Source → Pipeline → Destination), and a **Definitions** manager (shared mappings, enrichments, filters/asserts, retry policies). CSRF-protected forms.
 
 ## Reliability features
 
 - **Idempotency** — set an `idempotency_key_field` on any ingestion type (or it's derived from MSH-10 automatically for MLLP). Duplicate keys for the same channel are rejected at `enqueue()` via a `UNIQUE(channel_id, idempotency_key)` constraint — no separate check-then-insert race.
 - **Backpressure** — set `max_queue_depth` on any ingestion type. HTTP poller skips its tick, webhook returns `503`, MLLP NACKs (`AE`), file watcher leaves files in place — all without dropping anything, so the source system's own retry logic picks it back up once the queue drains.
-- **Persistent audit trail** — every `queued` / `processing_started` / `delivered` / `retry_scheduled` / `dead_lettered` / `duplicate_rejected` event is appended to `audit_log`, independent of the `queue` table's current-state-only row. Look up by trace_id from the dashboard ("Message Audit Trail Lookup") or `GET /api/audit/<trace_id>` — works for delivered and still-queued messages too, not just DLQ.
+- **Persistent audit trail** — every `queued` / `processing_started` / `delivered` / `retry_scheduled` / `dead_lettered` / `discarded` / `duplicate_rejected` event is appended to `audit_log`, independent of the `queue` table's current-state-only row. Look up by trace_id from the dashboard ("Message Audit Trail Lookup") or `GET /api/audit/<trace_id>` — works for delivered and still-queued messages too, not just DLQ.
 - **Multi-worker scaling** — set "Worker Threads" (`concurrency`) per channel. Safe because `PersistentQueue.dequeue_available()` atomically claims a row (via a single `UPDATE ... WHERE trace_id = (SELECT ...)` plus a per-call claim token to read back exactly the row it claimed) before handing it to a worker — verified under 8 concurrent threads racing the same queue with zero duplicate or dropped claims.
 - **Crash recovery** — if a worker dies between claiming a message (`PROCESSING`) and finishing it, that message would otherwise be stuck forever since no other worker will re-claim a `PROCESSING` row. `engine/main.py` runs a background loop calling `reclaim_stale_processing()` every 30s to put anything claimed longer than 2 minutes back to `QUEUED`.
 
@@ -55,3 +54,4 @@ The main control-plane dashboard — live channel health, queue metrics, and the
 
 - Config hot-reload staging/replay before a changed channel definition goes live (edits currently take effect on the next 2s config-sync tick, with no dry-run against recent messages first).
 - True multi-**process** horizontal scaling — `concurrency` currently spins up threads within one `engine/main.py` process. The queue is already safe for multiple OS processes against the same `queue.db` (SQLite WAL + the same atomic claim logic), so running a second `python -m engine.main` instance works today, but there's no supervisor/orchestration for it.
+- The FHIR codec covers the laboratory subset only (Patient / ServiceRequest / Specimen / Observation in a Bundle), not all FHIR resources.

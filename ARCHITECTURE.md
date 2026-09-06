@@ -1,9 +1,11 @@
 # INT-engine — System Architecture
 
-An **integration / HL7 interface engine**  written in
-Python. It is sync/thread-based throughout (no asyncio): JSON-configured
-**channels** (Ingestion → Enrichment → Transform → Destination), a persistent
-SQLite-backed message queue, a background **worker daemon**, and a
+An **integration / interface engine** for health and lab messaging
+written in Python. It is sync/thread-based throughout (no asyncio):
+declaratively configured **channels** stored in SQLite (each an inbound
+transport + codec, an ordered step chain, an outbound codec, and a
+destination), a persistent SQLite-backed message queue, a background
+**worker daemon**, and a
 **Flask + HTMX** control plane. It consumes and produces several wire formats —
 including **HL7 v2.5.1** and **FHIR R4** — but every format is normalized
 through a single, transport-independent **canonical model**.
