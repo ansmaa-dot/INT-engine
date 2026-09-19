@@ -4,6 +4,16 @@ An integration / interface engine for health and lab messaging written in Python
 
 > **Deep dive:** [`ARCHITECTURE.md`](ARCHITECTURE.md) is the current, authoritative reference (pipeline details, codecs, schema, reliability). This README is the quick start.
 
+## Project status
+
+This is a personal/educational project, built to explore interface-engine architecture and HL7/FHIR integration patterns. It is **not production-ready** and is not affiliated with, validated against, or intended as a replacement for any certified health IT product.
+
+- No formal security audit, clinical validation, or regulatory review (e.g. HIPAA, IEC 62304) has been performed.
+- Use in any environment handling real patient data is **not recommended** without independent review and hardening.
+- Provided as-is, for learning and demonstration purposes, with no warranty and no guarantee of fitness for a particular purpose.
+
+This repository is shared for portfolio and demonstration purposes only. No license is granted for reuse, modification, or distribution.
+
 ## Setup
 
 ```bash
